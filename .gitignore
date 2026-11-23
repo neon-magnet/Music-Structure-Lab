@@ -1,0 +1,12 @@
+.DS_Store
+/.build
+/.swiftpm
+/Packages
+*.xcodeproj
+xcuserdata/
+DerivedData/
+*.xcworkspace
+!/.swiftpm/xcode/package.xcworkspace
+# XcodeGen が project.yml から生成するファイル
+/App/Info.plist
+/App/MusicStructureLab.entitlements
