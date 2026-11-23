@@ -54,6 +54,19 @@ final class WaveformViewportTests: XCTestCase {
         XCTAssertEqual(viewport.startFrame, 45_000, accuracy: 1e-6)
     }
 
+    func testFollowPagesWhenPlayheadLeavesView() {
+        var viewport = WaveformViewport.fitting(totalFrames: 100_000, width: 1000)
+        viewport.zoom(by: 10, anchorX: 0, width: 1000) // 表示 0..<10_000
+        viewport.follow(frame: 5_000, width: 1000)
+        XCTAssertEqual(viewport.startFrame, 0, accuracy: 1e-9)
+        viewport.follow(frame: 12_000, width: 1000)
+        XCTAssertEqual(viewport.startFrame, 12_000, accuracy: 1e-9)
+        viewport.follow(frame: 95_000, width: 1000)
+        XCTAssertEqual(viewport.startFrame, 90_000, accuracy: 1e-9)
+        viewport.follow(frame: 500, width: 1000)
+        XCTAssertEqual(viewport.startFrame, 500, accuracy: 1e-9)
+    }
+
     func testCoordinateConversionRoundTrips() {
         var viewport = WaveformViewport.fitting(totalFrames: 10_000, width: 500)
         viewport.zoom(by: 3, anchorX: 120, width: 500)

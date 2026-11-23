@@ -31,14 +31,29 @@ final class AudioDocumentModel: ObservableObject {
 
     @Published var isImporterPresented = false
     @Published var displayMode: WaveformDisplayMode = .channels
-    /// クリックで指定した位置(フレーム)。今後の再生・区間編集の起点になる。
-    @Published var cursorFrame: Int?
+    /// 再生位置(フレーム)。クリックで移動し、再生中は再生に合わせて進む。
+    @Published private(set) var cursorFrame: Int?
+    @Published private(set) var isPlaying = false
 
     private let loader = AudioFileLoader()
+    private let player: AudioPlayer
+    private var playheadTimer: Timer?
     private var loadTask: Task<Void, Never>?
     private var loadToken = UUID()
 
+    init() {
+        player = AudioPlayer()
+        player.onFinished = { [weak self] in
+            guard let self else { return }
+            self.playbackStopped(at: self.player.totalFrames)
+        }
+        player.onInterrupted = { [weak self] frame in
+            self?.playbackStopped(at: frame)
+        }
+    }
+
     func open(url: URL) {
+        pause()
         loadTask?.cancel()
         let token = UUID()
         loadToken = token
@@ -77,10 +92,91 @@ final class AudioDocumentModel: ObservableObject {
 
     func close() {
         cancelLoading()
+        stopPlayheadTimer()
+        player.unload()
+        isPlaying = false
         audio = nil
         cursorFrame = nil
         documentID = UUID()
     }
+
+    // MARK: - Playback
+
+    var canPlay: Bool { audio != nil && !isLoading }
+
+    func togglePlayback() {
+        isPlaying ? pause() : play()
+    }
+
+    /// カーソル位置から再生する。末尾にいる場合は先頭から。
+    func play() {
+        guard let audio, canPlay else { return }
+        var start = cursorFrame ?? 0
+        if start >= audio.info.frameCount - 1 { start = 0 }
+        startPlayback(from: start)
+    }
+
+    func pause() {
+        guard isPlaying else { return }
+        cursorFrame = player.pause()
+        isPlaying = false
+        stopPlayheadTimer()
+    }
+
+    /// 再生位置を移動する。再生中ならその位置から再生を続ける。
+    func seek(to frame: Int) {
+        guard let audio else { return }
+        let clamped = min(max(0, frame), max(0, audio.info.frameCount - 1))
+        cursorFrame = clamped
+        if isPlaying {
+            startPlayback(from: clamped)
+        }
+    }
+
+    func returnToStart() {
+        seek(to: 0)
+    }
+
+    private func startPlayback(from frame: Int) {
+        do {
+            try player.play(from: frame)
+            cursorFrame = frame
+            isPlaying = player.isPlaying
+            if isPlaying { startPlayheadTimer() }
+        } catch {
+            isPlaying = false
+            stopPlayheadTimer()
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func playbackStopped(at frame: Int) {
+        isPlaying = false
+        stopPlayheadTimer()
+        if let audio {
+            cursorFrame = min(max(0, frame), max(0, audio.info.frameCount - 1))
+        }
+    }
+
+    private func startPlayheadTimer() {
+        stopPlayheadTimer()
+        // 画面の更新に合わせて約 60 回/秒、再生位置を読み取る。
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isPlaying else { return }
+                self.cursorFrame = self.player.currentFrame
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        playheadTimer = timer
+    }
+
+    private func stopPlayheadTimer() {
+        playheadTimer?.invalidate()
+        playheadTimer = nil
+    }
+
+    // MARK: - Loading callbacks
 
     private func reportProgress(_ progress: Double, token: UUID) {
         guard token == loadToken else { return }
@@ -89,6 +185,9 @@ final class AudioDocumentModel: ObservableObject {
 
     private func finishLoading(_ decoded: DecodedAudio, token: UUID) {
         guard token == loadToken else { return }
+        stopPlayheadTimer()
+        isPlaying = false
+        player.load(decoded)
         audio = decoded
         cursorFrame = nil
         documentID = UUID()

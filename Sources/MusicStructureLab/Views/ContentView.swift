@@ -13,11 +13,7 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     AudioInfoBar(info: audio.info)
                     Divider()
-                    WaveformPanel(
-                        audio: audio,
-                        displayMode: $model.displayMode,
-                        cursorFrame: $model.cursorFrame
-                    )
+                    WaveformPanel(audio: audio)
                     .id(model.documentID)
                 }
             } else if !model.isLoading {

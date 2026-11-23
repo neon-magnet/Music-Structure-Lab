@@ -81,6 +81,15 @@ public struct WaveformViewport: Equatable, Sendable {
         }
     }
 
+    /// 再生位置を追いかける。`frame` が表示範囲の外に出たら、そこが左端になるようページ送りする。
+    public mutating func follow(frame: Double, width: Double) {
+        let visible = visibleFrameCount(width: width)
+        if frame < startFrame || frame >= startFrame + visible {
+            startFrame = frame
+            clamp(width: width)
+        }
+    }
+
     public func frame(atX x: Double) -> Double {
         startFrame + x * framesPerPoint
     }

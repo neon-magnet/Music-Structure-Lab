@@ -12,14 +12,14 @@ struct WaveformLane {
 /// 波形表示エリア(操作バー・時間軸・波形・全体ミニマップ)。
 ///
 /// 操作:
-/// - クリック: カーソル位置を設定
+/// - クリック: 再生位置を移動
+/// - スペース: 再生 / 一時停止
 /// - ドラッグ / 横スクロール / マウスホイール: 左右に移動
 /// - ⌘ または ⌥ + スクロール、トラックパッドのピンチ: ポインタ位置を中心に拡大・縮小
 /// - 下のミニマップをクリック・ドラッグ: その位置へ移動
 struct WaveformPanel: View {
     let audio: DecodedAudio
-    @Binding var displayMode: WaveformDisplayMode
-    @Binding var cursorFrame: Int?
+    @EnvironmentObject private var model: AudioDocumentModel
 
     @State private var viewport: WaveformViewport
     @State private var hasFitted = false
@@ -30,18 +30,17 @@ struct WaveformPanel: View {
     @State private var magnifyOrigin: WaveformViewport?
     @StateObject private var scrollMonitor = ScrollWheelMonitor()
 
-    init(audio: DecodedAudio, displayMode: Binding<WaveformDisplayMode>, cursorFrame: Binding<Int?>) {
+    init(audio: DecodedAudio) {
         self.audio = audio
-        _displayMode = displayMode
-        _cursorFrame = cursorFrame
         _viewport = State(initialValue: WaveformViewport(totalFrames: audio.info.frameCount))
     }
 
     private var sampleRate: Double { audio.info.sampleRate }
     private var totalFrames: Int { audio.info.frameCount }
+    private var cursorFrame: Int? { model.cursorFrame }
 
     private var lanes: [WaveformLane] {
-        switch displayMode {
+        switch model.displayMode {
         case .mix:
             return [WaveformLane(title: "Mix", overview: audio.monoOverview, samples: audio.mono)]
         case .channels:
@@ -96,6 +95,11 @@ struct WaveformPanel: View {
             )
             .frame(height: 44)
         }
+        .onChange(of: model.cursorFrame) { frame in
+            // 再生中は再生位置が画面外に出たらページ送りする。
+            guard model.isPlaying, let frame, width > 0 else { return }
+            viewport.follow(frame: Double(frame), width: width)
+        }
         .onAppear {
             scrollMonitor.handler = { event in handleScroll(event) }
             scrollMonitor.start()
@@ -107,7 +111,26 @@ struct WaveformPanel: View {
 
     private var controls: some View {
         HStack(spacing: 12) {
-            Picker("表示", selection: $displayMode) {
+            Button { model.returnToStart() } label: {
+                Image(systemName: "backward.end.fill")
+            }
+            .help("先頭へ")
+
+            Button { model.togglePlayback() } label: {
+                Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+                    .frame(width: 16)
+            }
+            .keyboardShortcut(.space, modifiers: [])
+            .disabled(!model.canPlay)
+            .help(model.isPlaying ? "一時停止 (スペース)" : "再生 (スペース)")
+
+            Text("\(timeText(Double(cursorFrame ?? 0))) / \(TimeFormatting.string(fromSeconds: audio.info.duration))")
+                .font(.callout)
+                .monospacedDigit()
+
+            Divider().frame(height: 18)
+
+            Picker("表示", selection: $model.displayMode) {
                 ForEach(WaveformDisplayMode.allCases) { mode in
                     Text(mode.title).tag(mode)
                 }
@@ -145,8 +168,6 @@ struct WaveformPanel: View {
             Group {
                 Text("表示: \(timeText(viewport.startFrame)) – \(timeText(min(Double(totalFrames), viewport.startFrame + viewport.visibleFrameCount(width: width))))")
                 Text("ポインタ: \(hoverX.map { timeText(viewport.frame(atX: $0)) } ?? "—")")
-                    .frame(minWidth: 130, alignment: .leading)
-                Text("カーソル: \(cursorFrame.map { timeText(Double($0)) } ?? "—")")
                     .frame(minWidth: 130, alignment: .leading)
             }
             .font(.callout)
@@ -234,8 +255,7 @@ struct WaveformPanel: View {
 
     private func setCursor(atX x: Double) {
         guard totalFrames > 0 else { return }
-        let frame = Int(viewport.frame(atX: x).rounded())
-        cursorFrame = min(max(0, frame), totalFrames - 1)
+        model.seek(to: Int(viewport.frame(atX: x).rounded()))
     }
 
     private func center(onFrame frame: Double) {
