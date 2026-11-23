@@ -21,7 +21,7 @@ enum WaveformDisplayMode: String, CaseIterable, Identifiable {
 
 /// 波形上で選んでいるもの。
 enum Selection: Equatable {
-    case section(Section.ID)
+    case section(SongSection.ID)
     case chord(ChordSegment.ID)
 }
 
@@ -540,7 +540,7 @@ final class AudioDocumentModel: ObservableObject {
         }
     }
 
-    var selectedSection: Section? {
+    var selectedSection: SongSection? {
         guard case let .section(id) = selection else { return nil }
         return analysis?.sections.first { $0.id == id }
     }
@@ -562,7 +562,7 @@ final class AudioDocumentModel: ObservableObject {
     /// カーソル位置でセクションを分割する。
     func splitSectionAtCursor() {
         let time = cursorTime
-        var newID: Section.ID?
+        var newID: SongSection.ID?
         edit("セクションを分割") { newID = $0.splitSection(at: time) }
         if let newID { selection = .section(newID) }
     }

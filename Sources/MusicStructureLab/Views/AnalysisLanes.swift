@@ -34,11 +34,11 @@ struct BeatMark: Equatable {
 
 /// セクションの帯。クリックで選択、境界のドラッグで長さを変える。
 struct SectionLaneView: View {
-    let sections: [Section]
+    let sections: [SongSection]
     let viewport: WaveformViewport
     let sampleRate: Double
-    let selectedID: Section.ID?
-    let onSelect: (Section.ID) -> Void
+    let selectedID: SongSection.ID?
+    let onSelect: (SongSection.ID) -> Void
     let onMoveBoundary: (Int, Double) -> Void
     let onFinishBoundary: () -> Void
 
@@ -139,7 +139,7 @@ struct SectionLaneView: View {
         return nil
     }
 
-    private func section(atX x: CGFloat) -> Section? {
+    private func section(atX x: CGFloat) -> SongSection? {
         let t = time(atX: x)
         return sections.first { t >= $0.start && t < $0.end } ?? (t >= (sections.last?.end ?? 0) ? sections.last : nil)
     }

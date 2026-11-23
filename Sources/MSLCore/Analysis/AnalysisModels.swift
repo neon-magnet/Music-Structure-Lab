@@ -150,7 +150,7 @@ public struct ChordSegment: Codable, Equatable, Identifiable, Sendable {
 }
 
 /// 楽曲のセクション(イントロ、A メロ、サビなど)。
-public struct Section: Codable, Equatable, Identifiable, Sendable {
+public struct SongSection: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var start: Double
     public var end: Double
@@ -234,7 +234,7 @@ public struct AnalysisResult: Codable, Equatable, Sendable {
     public var key: MusicalKey?
     public var keyConfidence: Double
     public var chords: [ChordSegment]
-    public var sections: [Section]
+    public var sections: [SongSection]
 
     public init(
         duration: Double,
@@ -243,7 +243,7 @@ public struct AnalysisResult: Codable, Equatable, Sendable {
         key: MusicalKey?,
         keyConfidence: Double,
         chords: [ChordSegment],
-        sections: [Section]
+        sections: [SongSection]
     ) {
         self.version = Self.currentVersion
         self.duration = duration
@@ -257,7 +257,7 @@ public struct AnalysisResult: Codable, Equatable, Sendable {
 
     public var prefersFlats: Bool { key?.prefersFlats ?? false }
 
-    public func section(at time: Double) -> Section? {
+    public func section(at time: Double) -> SongSection? {
         sections.first { time >= $0.start && time < $0.end } ?? (time >= duration ? sections.last : nil)
     }
 

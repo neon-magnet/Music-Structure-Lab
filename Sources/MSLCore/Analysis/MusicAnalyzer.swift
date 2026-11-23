@@ -139,11 +139,11 @@ public struct MusicAnalyzer: Sendable {
             Features.l2Normalized(chromaVector) + Features.l2Normalized(timbreVector).map { $0 * 0.8 }
         }
         let structure = StructureAnalyzer.segment(features: beatFeatures, isDownbeat: grid.isDownbeat)
-        let sections = structure.enumerated().map { index, segment -> Section in
+        let sections = structure.enumerated().map { index, segment -> SongSection in
             let start = index == 0 ? 0 : beats[min(segment.startBeat, beats.count - 1)]
             let isLast = index == structure.count - 1
             let end = isLast || segment.endBeat >= beats.count ? duration : beats[segment.endBeat]
-            return Section(start: start, end: end, label: segment.label, name: "セクション \(segment.label)")
+            return SongSection(start: start, end: end, label: segment.label, name: "セクション \(segment.label)")
         }
         report(.structure, 1)
 
@@ -155,7 +155,7 @@ public struct MusicAnalyzer: Sendable {
             keyConfidence: key?.confidence ?? 0,
             chords: chords,
             sections: sections.isEmpty
-                ? [Section(start: 0, end: duration, label: "A", name: "セクション A")]
+                ? [SongSection(start: 0, end: duration, label: "A", name: "セクション A")]
                 : sections
         )
     }

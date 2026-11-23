@@ -202,7 +202,7 @@ private struct SummaryEditor: View {
 
 private struct SectionEditor: View {
     @EnvironmentObject private var model: AudioDocumentModel
-    let section: Section
+    let section: SongSection
     let analysis: AnalysisResult
 
     static let presetNames = ["イントロ", "A メロ", "B メロ", "サビ", "間奏", "C メロ", "ブリッジ", "ソロ", "アウトロ"]
@@ -280,7 +280,7 @@ private struct SectionEditor: View {
 
 /// セクション内のコード進行(作曲・分析の参考)。
 private struct SectionChordsView: View {
-    let section: Section
+    let section: SongSection
     let analysis: AnalysisResult
 
     var body: some View {

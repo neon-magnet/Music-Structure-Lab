@@ -16,9 +16,9 @@ final class AnalysisEditingTests: XCTestCase {
                 ChordSegment(start: 16, end: 40, chord: nil)
             ],
             sections: [
-                Section(start: 0, end: 16, label: "A", name: "A メロ"),
-                Section(start: 16, end: 32, label: "B", name: "サビ"),
-                Section(start: 32, end: 40, label: "A", name: "A メロ")
+                SongSection(start: 0, end: 16, label: "A", name: "A メロ"),
+                SongSection(start: 16, end: 32, label: "B", name: "サビ"),
+                SongSection(start: 32, end: 40, label: "A", name: "A メロ")
             ]
         )
     }
@@ -156,8 +156,8 @@ final class ExportTests: XCTestCase {
                 ChordSegment(start: 4.25, end: 10, chord: Chord(root: 9, quality: .minor))
             ],
             sections: [
-                Section(start: 0, end: 4.25, label: "A", name: "イントロ, 1"),
-                Section(start: 4.25, end: 10, label: "B", name: "サビ \"大\"")
+                SongSection(start: 0, end: 4.25, label: "A", name: "イントロ, 1"),
+                SongSection(start: 4.25, end: 10, label: "B", name: "サビ \"大\"")
             ]
         )
     }

@@ -8,26 +8,26 @@ extension AnalysisResult {
 
     // MARK: - Sections
 
-    public func sectionIndex(id: Section.ID) -> Int? {
+    public func sectionIndex(id: SongSection.ID) -> Int? {
         sections.firstIndex { $0.id == id }
     }
 
     /// `time` でセクションを 2 つに分ける。新しい(後ろの)セクションの ID を返す。
     @discardableResult
-    public mutating func splitSection(at time: Double) -> Section.ID? {
+    public mutating func splitSection(at time: Double) -> SongSection.ID? {
         guard let index = sections.firstIndex(where: { time > $0.start && time < $0.end }) else { return nil }
         let original = sections[index]
         guard time - original.start >= Self.minimumSegmentLength,
               original.end - time >= Self.minimumSegmentLength else { return nil }
         sections[index].end = time
-        let new = Section(start: time, end: original.end, label: original.label, name: original.name)
+        let new = SongSection(start: time, end: original.end, label: original.label, name: original.name)
         sections.insert(new, at: index + 1)
         return new.id
     }
 
     /// セクションを次のセクションと結合する(名前と記号は前のセクションのもの)。
     @discardableResult
-    public mutating func mergeSectionWithNext(id: Section.ID) -> Bool {
+    public mutating func mergeSectionWithNext(id: SongSection.ID) -> Bool {
         guard let index = sectionIndex(id: id), index + 1 < sections.count else { return false }
         sections[index].end = sections[index + 1].end
         sections.remove(at: index + 1)
@@ -36,7 +36,7 @@ extension AnalysisResult {
 
     /// セクションを削除し、その範囲を前のセクション(先頭なら次のセクション)に含める。
     @discardableResult
-    public mutating func removeSection(id: Section.ID) -> Bool {
+    public mutating func removeSection(id: SongSection.ID) -> Bool {
         guard sections.count > 1, let index = sectionIndex(id: id) else { return false }
         if index > 0 {
             sections[index - 1].end = sections[index].end
@@ -60,12 +60,12 @@ extension AnalysisResult {
         return clamped
     }
 
-    public mutating func renameSection(id: Section.ID, to name: String) {
+    public mutating func renameSection(id: SongSection.ID, to name: String) {
         guard let index = sectionIndex(id: id) else { return }
         sections[index].name = name
     }
 
-    public mutating func setSectionLabel(id: Section.ID, to label: String) {
+    public mutating func setSectionLabel(id: SongSection.ID, to label: String) {
         guard let index = sectionIndex(id: id) else { return }
         sections[index].label = label
     }
