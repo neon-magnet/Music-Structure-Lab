@@ -64,17 +64,47 @@ struct WaveformPanel: View {
                 VStack(spacing: 0) {
                     TimeRulerView(viewport: viewport, sampleRate: sampleRate)
                         .frame(height: 26)
+                        .contentShape(Rectangle())
+                        .gesture(dragGesture)
                     Divider()
+                    if let analysis = model.analysis {
+                        SectionLaneView(
+                            sections: analysis.sections,
+                            viewport: viewport,
+                            sampleRate: sampleRate,
+                            selectedID: model.selectedSection?.id,
+                            onSelect: { model.select(.section($0)) },
+                            onMoveBoundary: { index, time in
+                                model.previewEdit { $0.moveSectionBoundary(after: index, to: time) }
+                            },
+                            onFinishBoundary: { model.commitPreviewEdit("境界を移動") }
+                        )
+                        .frame(height: 30)
+                        ChordLaneView(
+                            chords: analysis.chords,
+                            key: analysis.key,
+                            viewport: viewport,
+                            sampleRate: sampleRate,
+                            selectedID: model.selectedChord?.id,
+                            onSelect: { model.select(.chord($0)) }
+                        )
+                        .frame(height: 26)
+                        Divider()
+                    }
                     WaveformCanvasView(
                         lanes: lanes,
                         viewport: viewport,
                         cursorFrame: cursorFrame,
-                        hoverX: hoverX
+                        hoverX: hoverX,
+                        beatMarks: beatMarks,
+                        barLabelEvery: barLabelEvery,
+                        highlight: model.selectionRange,
+                        isLooping: model.isLoopEnabled
                     )
+                    .contentShape(Rectangle())
+                    .gesture(dragGesture)
+                    .simultaneousGesture(magnifyGesture)
                 }
-                .contentShape(Rectangle())
-                .gesture(dragGesture)
-                .simultaneousGesture(magnifyGesture)
                 .onContinuousHover { phase in
                     switch phase {
                     case let .active(location): hoverX = location.x
@@ -120,13 +150,32 @@ struct WaveformPanel: View {
                 Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
                     .frame(width: 16)
             }
-            .keyboardShortcut(.space, modifiers: [])
             .disabled(!model.canPlay)
             .help(model.isPlaying ? "一時停止 (スペース)" : "再生 (スペース)")
 
             Text("\(timeText(Double(cursorFrame ?? 0))) / \(TimeFormatting.string(fromSeconds: audio.info.duration))")
                 .font(.callout)
                 .monospacedDigit()
+
+            if let barText {
+                Text(barText)
+                    .font(.callout)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Toggle(isOn: $model.isLoopEnabled) {
+                Image(systemName: "repeat")
+            }
+            .toggleStyle(.button)
+            .help("選択範囲をループ再生 (⌘L)")
+
+            Toggle(isOn: $model.isClickEnabled) {
+                Image(systemName: "metronome")
+            }
+            .toggleStyle(.button)
+            .disabled(model.analysis == nil)
+            .help("拍に合わせてクリック音を鳴らす (⌥⌘C)")
 
             Divider().frame(height: 18)
 
@@ -166,7 +215,6 @@ struct WaveformPanel: View {
             Spacer(minLength: 8)
 
             Group {
-                Text("表示: \(timeText(viewport.startFrame)) – \(timeText(min(Double(totalFrames), viewport.startFrame + viewport.visibleFrameCount(width: width))))")
                 Text("ポインタ: \(hoverX.map { timeText(viewport.frame(atX: $0)) } ?? "—")")
                     .frame(minWidth: 130, alignment: .leading)
             }
@@ -174,6 +222,57 @@ struct WaveformPanel: View {
             .monospacedDigit()
             .foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: - Analysis overlay
+
+    /// カーソル位置の小節と拍(例: "12小節 3拍")。
+    private var barText: String? {
+        guard let grid = model.analysis?.beatGrid, sampleRate > 0,
+              let index = grid.beatIndex(atOrBefore: Double(cursorFrame ?? 0) / sampleRate)
+        else { return nil }
+        let bar = grid.barNumber(ofBeat: index)
+        let beat = IntMathUI.mod(index - grid.downbeatOffset, grid.beatsPerBar) + 1
+        return bar == 0 ? "弱起 \(beat)拍" : "\(bar)小節 \(beat)拍"
+    }
+
+    private var beatSpacingPoints: Double {
+        guard let grid = model.analysis?.beatGrid, grid.bpm > 0, viewport.framesPerPoint > 0 else { return 0 }
+        return 60 / grid.bpm * sampleRate / viewport.framesPerPoint
+    }
+
+    private var barLabelEvery: Int {
+        guard let grid = model.analysis?.beatGrid else { return 1 }
+        let barSpacing = beatSpacingPoints * Double(grid.beatsPerBar)
+        guard barSpacing > 0 else { return 1 }
+        let every = Int((28 / barSpacing).rounded(.up))
+        // 1, 2, 4, 8, 16... に丸める
+        var value = 1
+        while value < every { value *= 2 }
+        return value
+    }
+
+    private var beatMarks: [BeatMark] {
+        guard let grid = model.analysis?.beatGrid, sampleRate > 0, width > 0 else { return [] }
+        let spacing = beatSpacingPoints
+        let showBeats = spacing >= 6
+        guard spacing * Double(grid.beatsPerBar) >= 4 else { return [] }
+        let startTime = viewport.startFrame / sampleRate
+        let endTime = (viewport.startFrame + viewport.visibleFrameCount(width: width)) / sampleRate
+        var index = grid.beatIndex(atOrBefore: startTime) ?? 0
+        var marks = [BeatMark]()
+        while index < grid.beats.count, grid.beats[index] <= endTime {
+            let isDownbeat = grid.isDownbeat(index)
+            if isDownbeat || showBeats {
+                marks.append(BeatMark(
+                    x: viewport.x(forFrame: grid.beats[index] * sampleRate),
+                    isDownbeat: isDownbeat,
+                    bar: isDownbeat ? grid.barNumber(ofBeat: index) : nil
+                ))
+            }
+            index += 1
+        }
+        return marks
     }
 
     // MARK: - Gestures
@@ -295,5 +394,11 @@ final class ScrollWheelMonitor: ObservableObject {
             NSEvent.removeMonitor(monitor)
         }
         monitor = nil
+    }
+}
+
+enum IntMathUI {
+    static func mod(_ a: Int, _ n: Int) -> Int {
+        ((a % n) + n) % n
     }
 }

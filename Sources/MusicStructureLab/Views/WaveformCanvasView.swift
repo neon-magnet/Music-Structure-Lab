@@ -10,12 +10,20 @@ struct WaveformCanvasView: View {
     let viewport: WaveformViewport
     let cursorFrame: Int?
     let hoverX: Double?
+    var beatMarks: [BeatMark] = []
+    /// 小節番号を何小節ごとに表示するか。
+    var barLabelEvery = 1
+    /// 選択範囲(フレーム)。
+    var highlight: Range<Int>?
+    var isLooping = false
 
     @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         Canvas { context, size in
             guard !lanes.isEmpty, size.width > 0, size.height > 0 else { return }
+            drawHighlight(context: context, size: size)
+            drawBeats(context: context, size: size)
             let laneHeight = size.height / CGFloat(lanes.count)
             for (index, lane) in lanes.enumerated() {
                 let rect = CGRect(x: 0, y: CGFloat(index) * laneHeight, width: size.width, height: laneHeight)
@@ -108,6 +116,43 @@ struct WaveformCanvasView: View {
             at: CGPoint(x: rect.minX + 8, y: rect.minY + 6),
             anchor: .topLeading
         )
+    }
+
+    private func drawHighlight(context: GraphicsContext, size: CGSize) {
+        guard let highlight else { return }
+        let x0 = CGFloat(viewport.x(forFrame: Double(highlight.lowerBound)))
+        let x1 = CGFloat(viewport.x(forFrame: Double(highlight.upperBound)))
+        guard x1 >= 0, x0 <= size.width else { return }
+        let rect = CGRect(x: x0, y: 0, width: max(1, x1 - x0), height: size.height)
+        context.fill(Path(rect), with: .color(Color.accentColor.opacity(isLooping ? 0.14 : 0.07)))
+        if isLooping {
+            for edge in [x0, x1] {
+                context.fill(Path(CGRect(x: edge - 0.5, y: 0, width: 1, height: size.height)), with: .color(Color.accentColor.opacity(0.7)))
+            }
+        }
+    }
+
+    private func drawBeats(context: GraphicsContext, size: CGSize) {
+        guard !beatMarks.isEmpty else { return }
+        var beats = Path()
+        var bars = Path()
+        for mark in beatMarks {
+            let rect = CGRect(x: CGFloat(mark.x), y: 0, width: 1, height: size.height)
+            if mark.isDownbeat {
+                bars.addRect(rect)
+                if let bar = mark.bar, bar > 0, (bar - 1) % max(1, barLabelEvery) == 0 {
+                    context.draw(
+                        Text("\(bar)").font(.caption2.monospacedDigit()).foregroundColor(.secondary),
+                        at: CGPoint(x: CGFloat(mark.x) + 3, y: size.height - 3),
+                        anchor: .bottomLeading
+                    )
+                }
+            } else {
+                beats.addRect(rect)
+            }
+        }
+        context.fill(beats, with: .color(.secondary.opacity(0.12)))
+        context.fill(bars, with: .color(.secondary.opacity(0.4)))
     }
 
     private func drawMarkers(context: GraphicsContext, size: CGSize) {

@@ -1,3 +1,4 @@
+import AppKit
 import MSLAudio
 import MSLCore
 import SwiftUI
@@ -5,26 +6,42 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var model: AudioDocumentModel
+    @Environment(\.undoManager) private var undoManager
     @State private var isDropTargeted = false
+    @State private var showsInspector = true
+    @StateObject private var keyMonitor = KeyCommandMonitor()
 
     var body: some View {
         ZStack {
             if let audio = model.audio {
-                VStack(spacing: 0) {
-                    AudioInfoBar(info: audio.info)
-                    Divider()
-                    WaveformPanel(audio: audio)
-                    .id(model.documentID)
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        AudioInfoBar(info: audio.info)
+                        Divider()
+                        WaveformPanel(audio: audio)
+                            .id(model.documentID)
+                    }
+                    if showsInspector {
+                        Divider()
+                        InspectorView()
+                            .frame(width: 330)
+                    }
                 }
             } else if !model.isLoading {
                 EmptyStateView { model.isImporterPresented = true }
             }
 
             if model.isLoading {
-                LoadingOverlay(
-                    fileName: model.loadingFileName,
+                ProgressOverlay(
+                    title: "読み込み中: \(model.loadingFileName)",
                     progress: model.loadingProgress,
                     onCancel: { model.cancelLoading() }
+                )
+            } else if model.isAnalyzing {
+                ProgressOverlay(
+                    title: "解析中: \(model.analysisStage.title)",
+                    progress: model.analysisProgress,
+                    onCancel: { model.cancelAnalysis() }
                 )
             }
 
@@ -37,20 +54,56 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
-        .navigationTitle(model.audio?.info.fileName ?? "Music Structure Lab")
+        .navigationTitle(model.displayTitle)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     model.isImporterPresented = true
                 } label: {
-                    Label("音源を開く", systemImage: "folder")
+                    Label("開く", systemImage: "folder")
                 }
-                .help("音源ファイルを開く (⌘O)")
+                .help("音源またはプロジェクトを開く (⌘O)")
+
+                Button {
+                    model.saveProject()
+                } label: {
+                    Label("保存", systemImage: "square.and.arrow.down")
+                }
+                .disabled(model.audio == nil)
+                .help("プロジェクトを保存 (⌘S)")
+
+                Button {
+                    model.analyze()
+                } label: {
+                    Label("解析", systemImage: "wand.and.stars")
+                }
+                .disabled(model.audio == nil || model.isAnalyzing)
+                .help(model.analysis == nil ? "解析を実行 (⌘R)" : "解析し直す (⌘R)")
+
+                Menu {
+                    ForEach(ExportFormat.allCases) { format in
+                        Button(format.title + "…") { model.export(format) }
+                    }
+                    Divider()
+                    Button("選択範囲の音声 (WAV)…") { model.exportSelectionAudio() }
+                        .disabled(model.selectionRange == nil)
+                } label: {
+                    Label("書き出し", systemImage: "square.and.arrow.up")
+                }
+                .disabled(model.analysis == nil)
+                .help("解析結果を書き出す")
+
+                Button {
+                    showsInspector.toggle()
+                } label: {
+                    Label("インスペクタ", systemImage: "sidebar.right")
+                }
+                .help("インスペクタの表示/非表示")
             }
         }
         .fileImporter(
             isPresented: $model.isImporterPresented,
-            allowedContentTypes: AudioFileLoader.supportedContentTypes,
+            allowedContentTypes: AudioFileLoader.supportedContentTypes + [.musicStructureLabProject],
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -68,7 +121,7 @@ struct ContentView: View {
             isDropTargeted = targeted
         }
         .alert(
-            "読み込めませんでした",
+            "エラー",
             isPresented: Binding(
                 get: { model.errorMessage != nil },
                 set: { if !$0 { model.errorMessage = nil } }
@@ -77,6 +130,35 @@ struct ContentView: View {
             Button("OK", role: .cancel) { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .onAppear {
+            model.undoManager = undoManager
+            keyMonitor.onSpace = { model.togglePlayback() }
+            keyMonitor.start()
+        }
+        .onChange(of: undoManager) { model.undoManager = $0 }
+    }
+}
+
+/// テキスト入力中でない時のスペースキーで再生/一時停止する。
+/// (ボタンのショートカットにすると、テキスト欄にスペースを打てなくなるため)
+@MainActor
+final class KeyCommandMonitor: ObservableObject {
+    var onSpace: (@MainActor () -> Void)?
+    private var monitor: Any?
+
+    func start() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                guard let self, event.keyCode == 49 else { return false }
+                let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+                guard modifiers.isEmpty else { return false }
+                if event.window?.firstResponder is NSText { return false }
+                self.onSpace?()
+                return true
+            }
+            return handled ? nil : event
         }
     }
 }
@@ -91,7 +173,7 @@ private struct EmptyStateView: View {
                 .foregroundStyle(.secondary)
             Text("音源ファイルを開いてください")
                 .font(.title2)
-            Text("ここにドラッグ&ドロップするか、「開く…」(⌘O) から選択します。\nWAV / AIFF / CAF / MP3 / AAC (M4A) / ALAC / FLAC に対応しています。")
+            Text("ここにドラッグ&ドロップするか、「開く…」(⌘O) から選択します。\nWAV / AIFF / CAF / MP3 / AAC (M4A) / ALAC / FLAC と、保存したプロジェクト (.mslab) を開けます。\n読み込むと自動でテンポ・キー・コード・構造を解析します。")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             Button("開く…", action: onOpen)
@@ -102,14 +184,14 @@ private struct EmptyStateView: View {
     }
 }
 
-private struct LoadingOverlay: View {
-    let fileName: String
+struct ProgressOverlay: View {
+    let title: String
     let progress: Double
     let onCancel: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("読み込み中: \(fileName)")
+            Text(title)
                 .font(.headline)
                 .lineLimit(1)
                 .truncationMode(.middle)

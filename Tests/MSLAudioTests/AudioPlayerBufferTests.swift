@@ -40,6 +40,22 @@ final class AudioPlayerBufferTests: XCTestCase {
         XCTAssertEqual(AudioPlayer.makeBuffer(from: audio, format: format, startFrame: 2)?.frameLength, 1)
     }
 
+    func testBufferRangeAndClicks() throws {
+        let silence = [Float](repeating: 0, count: 48_000)
+        let audio = makeAudio(channels: [silence, silence])
+        let format = try XCTUnwrap(AudioPlayer.playbackFormat(for: audio))
+        let buffer = try XCTUnwrap(AudioPlayer.makeBuffer(
+            from: audio, format: format, startFrame: 1_000, endFrame: 11_000,
+            clicks: [ClickMark(frame: 2_000, accent: true), ClickMark(frame: 30_000, accent: false)]
+        ))
+        XCTAssertEqual(buffer.frameLength, 10_000)
+        let data = try XCTUnwrap(buffer.floatChannelData)
+        let clickRegion = (1_000..<2_440).map { abs(data[0][$0]) }
+        XCTAssertGreaterThan(clickRegion.max() ?? 0, 0.1, "クリック音が足されている")
+        XCTAssertEqual((0..<1_000).map { abs(data[1][$0]) }.max(), 0, "クリックより前は無音のまま")
+        XCTAssertEqual((5_000..<10_000).map { abs(data[0][$0]) }.max(), 0, "範囲外のクリックは足さない")
+    }
+
     func testMultichannelAudioPlaysMonoMix() throws {
         let audio = makeAudio(channels: [[0.3, 0.3], [0.6, 0.0], [0.0, 0.3]])
         XCTAssertEqual(AudioPlayer.playbackChannelCount(for: audio), 1)

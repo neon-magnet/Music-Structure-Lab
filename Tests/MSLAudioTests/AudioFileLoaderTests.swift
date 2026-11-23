@@ -82,6 +82,23 @@ final class AudioFileLoaderTests: XCTestCase {
         XCTAssertEqual(audio.monoOverview.sampleCount, frames)
     }
 
+    func testExportedSectionCanBeReadBack() throws {
+        let source = try writeTestWAV(name: "source.wav", sampleRate: 44_100, frames: 44_100)
+        let audio = try AudioFileLoader().load(from: source)
+        let exported = directory.appendingPathComponent("section.wav")
+        try AudioExporter.writeWAV(audio, frames: 10_000..<30_000, to: exported)
+
+        let section = try AudioFileLoader().load(from: exported)
+        XCTAssertEqual(section.info.frameCount, 20_000)
+        XCTAssertEqual(section.info.channelCount, 2)
+        XCTAssertEqual(section.info.sourceFormatDescription, "Linear PCM 24-bit")
+        for index in [0, 1_234, 19_999] {
+            XCTAssertEqual(section.channels[0][index], audio.channels[0][10_000 + index], accuracy: 1e-4)
+            XCTAssertEqual(section.channels[1][index], audio.channels[1][10_000 + index], accuracy: 1e-4)
+        }
+        XCTAssertThrowsError(try AudioExporter.writeWAV(audio, frames: 50_000..<60_000, to: exported))
+    }
+
     func testReportsProgressUpToCompletion() throws {
         let url = try writeTestWAV(name: "progress.wav", sampleRate: 48_000, frames: 48_000)
         let recorder = ProgressRecorder()

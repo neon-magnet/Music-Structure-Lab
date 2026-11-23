@@ -16,6 +16,18 @@ public enum AudioPlaybackError: LocalizedError {
     }
 }
 
+/// クリック音を鳴らす位置。
+public struct ClickMark: Equatable, Sendable {
+    public var frame: Int
+    /// 小節頭など、強く鳴らす位置か。
+    public var accent: Bool
+
+    public init(frame: Int, accent: Bool) {
+        self.frame = frame
+        self.accent = accent
+    }
+}
+
 /// デコード済みの音源を AVAudioEngine で再生する。
 ///
 /// 再生開始・シークのたびに、指定位置から末尾までのサンプルを再生用バッファへコピーして
@@ -37,6 +49,8 @@ public final class AudioPlayer {
     private var audio: DecodedAudio?
     private var format: AVAudioFormat?
     private var segmentStart = 0
+    private var segmentLength = 0
+    private var isLooping = false
     private var pausedFrame = 0
     /// 古いバッファの完了通知を無視するための番号。
     private var generation = 0
@@ -62,7 +76,11 @@ public final class AudioPlayer {
               let nodeTime = node.lastRenderTime,
               let playerTime = node.playerTime(forNodeTime: nodeTime)
         else { return pausedFrame }
-        return Swift.min(totalFrames, segmentStart + Swift.max(0, Int(playerTime.sampleTime)))
+        var elapsed = Swift.max(0, Int(playerTime.sampleTime))
+        if isLooping, segmentLength > 0 {
+            elapsed %= segmentLength
+        }
+        return Swift.min(totalFrames, segmentStart + elapsed)
     }
 
     /// 再生する音源を差し替える。再生中なら止める。
@@ -89,14 +107,19 @@ public final class AudioPlayer {
     }
 
     /// `frame` から再生する。再生中に呼ぶとその位置へ移動する。
-    public func play(from frame: Int) throws {
+    /// - Parameters:
+    ///   - endFrame: ここで止める(nil なら末尾まで)。
+    ///   - loop: `frame..<endFrame` を繰り返す。
+    ///   - clicks: クリック音を重ねる位置。
+    public func play(from frame: Int, until endFrame: Int? = nil, loop: Bool = false, clicks: [ClickMark] = []) throws {
         guard let audio, let format else { return }
         let start = Swift.min(Swift.max(0, frame), audio.info.frameCount)
-        guard start < audio.info.frameCount else {
-            pausedFrame = audio.info.frameCount
+        let end = Swift.min(audio.info.frameCount, endFrame ?? audio.info.frameCount)
+        guard start < end else {
+            pausedFrame = start
             return
         }
-        guard let buffer = Self.makeBuffer(from: audio, format: format, startFrame: start) else {
+        guard let buffer = Self.makeBuffer(from: audio, format: format, startFrame: start, endFrame: end, clicks: clicks) else {
             throw AudioPlaybackError.bufferCreationFailed
         }
 
@@ -113,12 +136,14 @@ public final class AudioPlayer {
             }
         }
 
-        node.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [self] _ in
+        node.scheduleBuffer(buffer, at: nil, options: loop ? [.loops] : [], completionCallbackType: .dataPlayedBack) { [self] _ in
             Task { @MainActor in
                 self.segmentFinished(generation: current)
             }
         }
         segmentStart = start
+        segmentLength = end - start
+        isLooping = loop
         pausedFrame = start
         node.play()
         isPlaying = true
@@ -143,7 +168,7 @@ public final class AudioPlayer {
     private func segmentFinished(generation finished: Int) {
         guard finished == generation, isPlaying else { return }
         stop()
-        pausedFrame = totalFrames
+        pausedFrame = segmentStart + segmentLength
         onFinished?()
     }
 
@@ -176,11 +201,19 @@ public final class AudioPlayer {
         return AVAudioFormat(standardFormatWithSampleRate: audio.info.sampleRate, channels: AVAudioChannelCount(channels))
     }
 
-    /// `startFrame` から末尾までのサンプルを、`format`(非インターリーブ float)のバッファにコピーする。
-    nonisolated static func makeBuffer(from audio: DecodedAudio, format: AVAudioFormat, startFrame: Int) -> AVAudioPCMBuffer? {
+    /// `startFrame..<endFrame`(既定は末尾まで)のサンプルを、`format`(非インターリーブ float)のバッファにコピーする。
+    /// `clicks` の位置にはクリック音を足す。
+    nonisolated static func makeBuffer(
+        from audio: DecodedAudio,
+        format: AVAudioFormat,
+        startFrame: Int,
+        endFrame: Int? = nil,
+        clicks: [ClickMark] = []
+    ) -> AVAudioPCMBuffer? {
         let total = audio.info.frameCount
-        guard startFrame >= 0, startFrame < total else { return nil }
-        let length = total - startFrame
+        let end = Swift.min(total, endFrame ?? total)
+        guard startFrame >= 0, startFrame < end else { return nil }
+        let length = end - startFrame
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(length)),
               let destination = buffer.floatChannelData
         else { return nil }
@@ -195,6 +228,32 @@ public final class AudioPlayer {
             }
         }
         buffer.frameLength = AVAudioFrameCount(length)
+        if !clicks.isEmpty {
+            addClicks(clicks, to: buffer, startFrame: startFrame, sampleRate: format.sampleRate)
+        }
         return buffer
+    }
+
+    /// 短い減衰する正弦波をクリック音として足す(小節頭は高く・大きく)。
+    nonisolated static func addClicks(_ clicks: [ClickMark], to buffer: AVAudioPCMBuffer, startFrame: Int, sampleRate: Double) {
+        guard let data = buffer.floatChannelData else { return }
+        let length = Int(buffer.frameLength)
+        let clickLength = Int(sampleRate * 0.03)
+        let channels = Int(buffer.format.channelCount)
+        for click in clicks {
+            let offset = click.frame - startFrame
+            guard offset + clickLength > 0, offset < length else { continue }
+            let frequency = click.accent ? 1_600.0 : 1_100.0
+            let amplitude: Float = click.accent ? 0.45 : 0.3
+            for i in Swift.max(0, -offset)..<clickLength {
+                let index = offset + i
+                guard index < length else { break }
+                let t = Double(i) / sampleRate
+                let value = amplitude * Float(exp(-t * 120) * sin(2 * Double.pi * frequency * t))
+                for channel in 0..<channels {
+                    data[channel][index] += value
+                }
+            }
+        }
     }
 }
