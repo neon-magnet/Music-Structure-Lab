@@ -34,6 +34,9 @@ public struct ClickMark: Equatable, Sendable {
 /// AVAudioPlayerNode に渡す。音源全体の複製を常に持たずに済み、位置はサンプル単位で正確になる。
 /// 3 チャンネル以上の音源はモノラルミックスを再生する。
 ///
+/// 分離したパートを鳴らす時は、パートごとに AVAudioPlayerNode を用意し、同じ時刻に再生を始める。
+/// パートの音量は再生中でも変えられる。クリック音は専用のノードで鳴らす(パートのミュートの影響を受けない)。
+///
 /// メインスレッドから使うこと。
 @MainActor
 public final class AudioPlayer {
@@ -45,8 +48,13 @@ public final class AudioPlayer {
     public private(set) var isPlaying = false
 
     private let engine = AVAudioEngine()
-    private let node = AVAudioPlayerNode()
+    /// `voices` と同じ順のノード。
+    private var nodes: [AVAudioPlayerNode] = []
+    private let clickNode = AVAudioPlayerNode()
     private var audio: DecodedAudio?
+    /// 同時に鳴らす音声。`voices[voice][channel][frame]`。既定は元の音源 1 つ。
+    private var voices: [[[Float]]] = []
+    private var gains: [Float] = []
     private var format: AVAudioFormat?
     private var segmentStart = 0
     private var segmentLength = 0
@@ -56,7 +64,7 @@ public final class AudioPlayer {
     private var generation = 0
 
     public init() {
-        engine.attach(node)
+        engine.attach(clickNode)
         NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
@@ -70,9 +78,13 @@ public final class AudioPlayer {
 
     public var totalFrames: Int { audio?.info.frameCount ?? 0 }
 
+    /// 同時に鳴らしている音声の数(元の音源なら 1、パート別なら パート数)。
+    public var voiceCount: Int { voices.count }
+
     /// 現在の再生位置(フレーム)。停止中は最後に止めた位置。
     public var currentFrame: Int {
         guard isPlaying,
+              let node = nodes.first,
               let nodeTime = node.lastRenderTime,
               let playerTime = node.playerTime(forNodeTime: nodeTime)
         else { return pausedFrame }
@@ -83,18 +95,13 @@ public final class AudioPlayer {
         return Swift.min(totalFrames, segmentStart + elapsed)
     }
 
-    /// 再生する音源を差し替える。再生中なら止める。
+    /// 再生する音源を差し替える。再生中なら止める。パート別の再生は解除される。
     public func load(_ audio: DecodedAudio) {
         stop()
         self.audio = audio
         pausedFrame = 0
-        let format = Self.playbackFormat(for: audio)
-        self.format = format
-        engine.disconnectNodeOutput(node)
-        if let format {
-            engine.connect(node, to: engine.mainMixerNode, format: format)
-            engine.prepare()
-        }
+        format = Self.playbackFormat(for: audio)
+        setVoicesWithoutRestart([Self.playbackChannels(for: audio)], gains: [1])
     }
 
     public func unload() {
@@ -102,8 +109,56 @@ public final class AudioPlayer {
         audio = nil
         format = nil
         pausedFrame = 0
-        engine.disconnectNodeOutput(node)
+        setVoicesWithoutRestart([], gains: [])
         engine.stop()
+    }
+
+    /// 同時に鳴らす音声を差し替える(nil で元の音源に戻す)。
+    /// 各音声は `playbackChannelCount` チャンネル・音源と同じ長さであること。再生中なら止めて、その位置を返す。
+    @discardableResult
+    public func setVoices(_ newVoices: [[[Float]]]?, gains newGains: [Float]? = nil) -> Int {
+        let frame = pause()
+        guard let audio else { return frame }
+        let resolved = newVoices ?? [Self.playbackChannels(for: audio)]
+        let resolvedGains = newGains ?? [Float](repeating: 1, count: resolved.count)
+        setVoicesWithoutRestart(resolved, gains: resolvedGains)
+        return frame
+    }
+
+    /// 音声ごとの音量(0...1)。再生中にも反映される。
+    public func setGains(_ newGains: [Float]) {
+        gains = newGains
+        for (index, node) in nodes.enumerated() {
+            node.volume = index < newGains.count ? Swift.max(0, Swift.min(1, newGains[index])) : 1
+        }
+    }
+
+    private func setVoicesWithoutRestart(_ newVoices: [[[Float]]], gains newGains: [Float]) {
+        voices = newVoices
+        while nodes.count > newVoices.count {
+            let node = nodes.removeLast()
+            engine.disconnectNodeOutput(node)
+            engine.detach(node)
+        }
+        while nodes.count < newVoices.count {
+            let node = AVAudioPlayerNode()
+            engine.attach(node)
+            nodes.append(node)
+        }
+        connectNodes()
+        setGains(newGains)
+    }
+
+    private func connectNodes() {
+        for node in nodes + [clickNode] {
+            engine.disconnectNodeOutput(node)
+            if let format {
+                engine.connect(node, to: engine.mainMixerNode, format: format)
+            }
+        }
+        if format != nil, !nodes.isEmpty {
+            engine.prepare()
+        }
     }
 
     /// `frame` から再生する。再生中に呼ぶとその位置へ移動する。
@@ -112,20 +167,38 @@ public final class AudioPlayer {
     ///   - loop: `frame..<endFrame` を繰り返す。
     ///   - clicks: クリック音を重ねる位置。
     public func play(from frame: Int, until endFrame: Int? = nil, loop: Bool = false, clicks: [ClickMark] = []) throws {
-        guard let audio, let format else { return }
+        guard let audio, let format, !voices.isEmpty else { return }
         let start = Swift.min(Swift.max(0, frame), audio.info.frameCount)
         let end = Swift.min(audio.info.frameCount, endFrame ?? audio.info.frameCount)
         guard start < end else {
             pausedFrame = start
             return
         }
-        guard let buffer = Self.makeBuffer(from: audio, format: format, startFrame: start, endFrame: end, clicks: clicks) else {
-            throw AudioPlaybackError.bufferCreationFailed
+        var buffers = [AVAudioPCMBuffer]()
+        for channels in voices {
+            guard let buffer = Self.makeBuffer(channels: channels, frameCount: audio.info.frameCount, format: format, startFrame: start, endFrame: end) else {
+                throw AudioPlaybackError.bufferCreationFailed
+            }
+            buffers.append(buffer)
+        }
+        var clickBuffer: AVAudioPCMBuffer?
+        if !clicks.isEmpty {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(end - start)) else {
+                throw AudioPlaybackError.bufferCreationFailed
+            }
+            buffer.frameLength = AVAudioFrameCount(end - start)
+            if let data = buffer.floatChannelData {
+                for channel in 0..<Int(format.channelCount) {
+                    data[channel].update(repeating: 0, count: end - start)
+                }
+            }
+            Self.addClicks(clicks, to: buffer, startFrame: start, sampleRate: format.sampleRate)
+            clickBuffer = buffer
         }
 
         generation += 1
         let current = generation
-        node.stop()
+        stopNodes()
 
         if !engine.isRunning {
             do {
@@ -136,16 +209,34 @@ public final class AudioPlayer {
             }
         }
 
-        node.scheduleBuffer(buffer, at: nil, options: loop ? [.loops] : [], completionCallbackType: .dataPlayedBack) { [self] _ in
-            Task { @MainActor in
-                self.segmentFinished(generation: current)
+        let options: AVAudioPlayerNodeBufferOptions = loop ? [.loops] : []
+        for (index, node) in nodes.enumerated() {
+            if index == 0 {
+                node.scheduleBuffer(buffers[index], at: nil, options: options, completionCallbackType: .dataPlayedBack) { [self] _ in
+                    Task { @MainActor in
+                        self.segmentFinished(generation: current)
+                    }
+                }
+            } else {
+                node.scheduleBuffer(buffers[index], at: nil, options: options, completionHandler: nil)
             }
+        }
+        if let clickBuffer {
+            clickNode.scheduleBuffer(clickBuffer, at: nil, options: options, completionHandler: nil)
         }
         segmentStart = start
         segmentLength = end - start
         isLooping = loop
         pausedFrame = start
-        node.play()
+
+        // 複数のノードを同じ時刻から鳴らす(少し先の時刻を指定して、開始のずれを無くす)。
+        let playing = nodes + (clickBuffer != nil ? [clickNode] : [])
+        if playing.count > 1 {
+            let startTime = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.05))
+            for node in playing { node.play(at: startTime) }
+        } else {
+            playing.first?.play()
+        }
         isPlaying = true
     }
 
@@ -161,8 +252,13 @@ public final class AudioPlayer {
 
     private func stop() {
         generation += 1
-        node.stop()
+        stopNodes()
         isPlaying = false
+    }
+
+    private func stopNodes() {
+        for node in nodes { node.stop() }
+        clickNode.stop()
     }
 
     private func segmentFinished(generation finished: Int) {
@@ -178,11 +274,7 @@ public final class AudioPlayer {
         let frame = currentFrame
         stop()
         pausedFrame = frame
-        if let format {
-            engine.disconnectNodeOutput(node)
-            engine.connect(node, to: engine.mainMixerNode, format: format)
-            engine.prepare()
-        }
+        connectNodes()
         if wasPlaying {
             onInterrupted?(frame)
         }
@@ -201,6 +293,12 @@ public final class AudioPlayer {
         return AVAudioFormat(standardFormatWithSampleRate: audio.info.sampleRate, channels: AVAudioChannelCount(channels))
     }
 
+    /// 再生に使うチャンネルのサンプル(モノラル・ステレオはそのまま、それ以上はモノラルミックス)。
+    /// パート分離の入力にもこれを使い、分離したパートが同じチャンネル数になるようにする。
+    public nonisolated static func playbackChannels(for audio: DecodedAudio) -> [[Float]] {
+        playbackChannelCount(for: audio) == audio.channels.count ? audio.channels : [audio.mono]
+    }
+
     /// `startFrame..<endFrame`(既定は末尾まで)のサンプルを、`format`(非インターリーブ float)のバッファにコピーする。
     /// `clicks` の位置にはクリック音を足す。
     nonisolated static func makeBuffer(
@@ -210,27 +308,42 @@ public final class AudioPlayer {
         endFrame: Int? = nil,
         clicks: [ClickMark] = []
     ) -> AVAudioPCMBuffer? {
-        let total = audio.info.frameCount
+        guard let buffer = makeBuffer(
+            channels: playbackChannels(for: audio),
+            frameCount: audio.info.frameCount,
+            format: format,
+            startFrame: startFrame,
+            endFrame: endFrame
+        ) else { return nil }
+        if !clicks.isEmpty {
+            addClicks(clicks, to: buffer, startFrame: startFrame, sampleRate: format.sampleRate)
+        }
+        return buffer
+    }
+
+    /// チャンネルごとのサンプル列から再生用バッファを作る。
+    nonisolated static func makeBuffer(
+        channels sources: [[Float]],
+        frameCount total: Int,
+        format: AVAudioFormat,
+        startFrame: Int,
+        endFrame: Int? = nil
+    ) -> AVAudioPCMBuffer? {
         let end = Swift.min(total, endFrame ?? total)
         guard startFrame >= 0, startFrame < end else { return nil }
         let length = end - startFrame
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(length)),
+        guard sources.count == Int(format.channelCount),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(length)),
               let destination = buffer.floatChannelData
         else { return nil }
-
-        let sources: [[Float]] = playbackChannelCount(for: audio) == audio.channels.count ? audio.channels : [audio.mono]
-        guard sources.count == Int(format.channelCount) else { return nil }
         for (channel, samples) in sources.enumerated() {
-            guard samples.count >= total else { return nil }
+            guard samples.count >= end else { return nil }
             samples.withUnsafeBufferPointer { pointer in
                 guard let base = pointer.baseAddress else { return }
                 destination[channel].update(from: base + startFrame, count: length)
             }
         }
         buffer.frameLength = AVAudioFrameCount(length)
-        if !clicks.isEmpty {
-            addClicks(clicks, to: buffer, startFrame: startFrame, sampleRate: format.sampleRate)
-        }
         return buffer
     }
 

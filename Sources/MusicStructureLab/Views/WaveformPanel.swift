@@ -7,6 +7,9 @@ struct WaveformLane {
     let title: String
     let overview: WaveformOverview
     let samples: [Float]
+    var color: Color = .accentColor
+    /// ミュート中のパートなどを薄く描く。
+    var opacity: Double = 1
 }
 
 /// 波形表示エリア(操作バー・時間軸・波形・全体ミニマップ)。
@@ -43,6 +46,21 @@ struct WaveformPanel: View {
         switch model.displayMode {
         case .mix:
             return [WaveformLane(title: "Mix", overview: audio.monoOverview, samples: audio.mono)]
+        case .stems:
+            guard let stems = model.stems else {
+                return [WaveformLane(title: "Mix", overview: audio.monoOverview, samples: audio.mono)]
+            }
+            return StemKind.allCases.compactMap { kind -> WaveformLane? in
+                guard let overview = stems.overviews[kind] else { return nil }
+                let audible = model.stemMix.gain(for: kind) > 0
+                return WaveformLane(
+                    title: kind.displayName + (audible ? "" : "(消音中)"),
+                    overview: overview,
+                    samples: stems.channels(for: kind).first ?? [],
+                    color: StemPalette.color(for: kind),
+                    opacity: audible ? 1 : 0.3
+                )
+            }
         case .channels:
             return audio.channelOverviews.indices.map { index in
                 WaveformLane(
@@ -180,7 +198,7 @@ struct WaveformPanel: View {
             Divider().frame(height: 18)
 
             Picker("表示", selection: $model.displayMode) {
-                ForEach(WaveformDisplayMode.allCases) { mode in
+                ForEach(WaveformDisplayMode.allCases.filter { $0 != .stems || model.stems != nil }) { mode in
                     Text(mode.title).tag(mode)
                 }
             }

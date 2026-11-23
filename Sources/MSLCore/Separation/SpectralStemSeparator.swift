@@ -1,0 +1,479 @@
+import Foundation
+
+/// モデルを使わない、信号処理によるパートの近似分離。
+///
+/// 1. 短時間フーリエ変換の振幅に、時間方向・周波数方向のメディアンフィルタをかけ、
+///    持続音成分 H と打楽器成分 P を求める(HPSS, Fitzgerald 2010)。
+/// 2. 打楽器成分の割合 P²/(H²+P²) を ドラム に振り分ける。
+/// 3. 持続音成分のうち、低域(既定で 180Hz 以下、300Hz までなだらかに減らす)を ベース にする。
+/// 4. 持続音成分から主旋律の音高を追い(倍音の重み付き和 + 音高の跳躍を抑える動的計画法)、
+///    その倍音の周波数を メロディ にする。
+/// 5. 残りを コード(伴奏) にする(元の信号からほかのパートを引いて作るので、全パートの和は元の音と一致する)。
+///
+/// あくまで近似で、パート間の漏れは大きい。ボーカルの子音はドラムに、低音の楽器はベースに入る。
+public struct SpectralStemSeparator: Sendable {
+    public struct Parameters: Sendable {
+        /// メディアンフィルタの長さ(フレーム数・ビン数。奇数)。
+        public var harmonicMedianLength = 17
+        public var percussiveMedianLength = 17
+        public var bassFullBelow = 180.0
+        public var bassNoneAbove = 300.0
+        public var melodyLowestHz = 150.0
+        public var melodyHighestHz = 1_100.0
+        /// メロディとして取り出す倍音の上限周波数。
+        public var melodyMaxHarmonicHz = 10_000.0
+        public var salienceHarmonics = 10
+        /// 音高候補の細かさ(半音あたりの候補数)。
+        public var stepsPerSemitone = 2
+        /// 音高の跳躍に対するペナルティ(候補 1 つ分あたり)。
+        public var jumpPenalty: Float = 0.12
+        /// 有声と判定する、候補の中での最大値と平均の比。
+        public var voicingPeakRatio: Float = 1.8
+        /// 有声と判定する、フレームの最大値の曲全体(大きい方から 5% の位置)に対する比。
+        /// 伴奏だけの区間をメロディとして拾わないためのもの。
+        public var voicingSalienceRatio: Float = 0.75
+        /// 有声と判定する、フレームの持続音の大きさ(大きい方から 5% の位置に対する比)。
+        public var voicingLevelRatio: Float = 0.05
+        /// これより短い有声区間は無声として扱う(秒)。
+        public var minimumVoicedDuration = 0.12
+
+        public init() {}
+    }
+
+    public var parameters: Parameters
+
+    public init(parameters: Parameters = Parameters()) {
+        self.parameters = parameters
+    }
+
+    /// サンプルレートに合わせた FFT 長(約 93ms)。
+    public static func fftSize(for sampleRate: Double) -> Int {
+        let target = max(256.0, sampleRate * 0.0929)
+        var size = 256
+        while Double(size) * 1.414 < target { size *= 2 }
+        return size
+    }
+
+    /// - Parameters:
+    ///   - channels: 再生と同じチャンネル(モノラルかステレオ)。長さは揃っていること。
+    ///   - progress: 0...1。
+    public func separate(
+        channels: [[Float]],
+        sampleRate: Double,
+        progress: (Double) -> Void = { _ in }
+    ) throws -> StemSet {
+        let frameCount = channels.map(\.count).min() ?? 0
+        let fftSize = Self.fftSize(for: sampleRate)
+        let hop = fftSize / 4
+        guard !channels.isEmpty, frameCount > 0, sampleRate > 0, let fft = RealFFT(size: fftSize) else {
+            let empty = channels.map { _ in [Float](repeating: 0, count: frameCount) }
+            var stems = [StemKind: [[Float]]]()
+            for kind in StemKind.allCases { stems[kind] = empty }
+            stems[.chords] = channels.map { Array($0.prefix(frameCount)) }
+            return StemSet(method: .spectral, detail: "", sampleRate: sampleRate, frameCount: frameCount, stems: stems)
+        }
+        let bins = fft.binCount
+        let frames = frameCount / hop + 1
+        let window = Window.hann(fftSize)
+        let binHz = sampleRate / Double(fftSize)
+
+        // 1. モノラルの振幅スペクトログラム。
+        var mono = [Float](repeating: 0, count: frameCount)
+        let channelScale = 1 / Float(channels.count)
+        for channel in channels {
+            for i in 0..<frameCount { mono[i] += channel[i] * channelScale }
+        }
+        var magnitude = [Float](repeating: 0, count: frames * bins)
+        var frameBuffer = [Float](repeating: 0, count: fftSize)
+        var re = [Float](repeating: 0, count: bins)
+        var im = [Float](repeating: 0, count: bins)
+        for t in 0..<frames {
+            if t % 64 == 0 {
+                try Task.checkCancellation()
+                progress(0.2 * Double(t) / Double(frames))
+            }
+            Self.fillFrame(&frameBuffer, from: mono, frameCount: frameCount, start: t * hop - fftSize / 2, window: window)
+            fft.forward(frameBuffer, real: &re, imag: &im)
+            let base = t * bins
+            for k in 0..<bins {
+                magnitude[base + k] = (re[k] * re[k] + im[k] * im[k]).squareRoot()
+            }
+        }
+        mono = []
+
+        // 2. 持続音成分(時間方向のメディアン)。
+        let harmonic = try Self.medianOverTime(magnitude, frames: frames, bins: bins, length: parameters.harmonicMedianLength) {
+            progress(0.2 + 0.2 * $0)
+        }
+        // 打楽器成分(周波数方向のメディアン)。振幅の配列をそのまま置き換える。
+        var percussive = magnitude
+        magnitude = []
+        try Self.medianOverFrequencyInPlace(&percussive, frames: frames, bins: bins, length: parameters.percussiveMedianLength)
+        progress(0.45)
+
+        // 3. 主旋律の音高。
+        let melody = try trackMelody(harmonic: harmonic, frames: frames, bins: bins, binHz: binHz, frameRate: sampleRate / Double(hop))
+        progress(0.55)
+
+        // 4. マスクをかけて逆変換する。
+        let bassWeight = (0..<bins).map { k -> Float in
+            let f = Double(k) * binHz
+            if f <= parameters.bassFullBelow { return 1 }
+            if f >= parameters.bassNoneAbove { return 0 }
+            let x = (f - parameters.bassFullBelow) / (parameters.bassNoneAbove - parameters.bassFullBelow)
+            return Float(0.5 + 0.5 * cos(Double.pi * x))
+        }
+        let extracted: [StemKind] = [.drums, .bass, .melody]
+        var outputs = [[[Float]]](
+            repeating: channels.map { _ in [Float](repeating: 0, count: frameCount) },
+            count: extracted.count
+        )
+        var masks = [[Float]](repeating: [Float](repeating: 0, count: bins), count: extracted.count)
+        var melodyWeight = [Float](repeating: 0, count: bins)
+        var maskedRe = [Float](repeating: 0, count: bins)
+        var maskedIm = [Float](repeating: 0, count: bins)
+        var timeSignal = [Float](repeating: 0, count: fftSize)
+
+        for t in 0..<frames {
+            if t % 32 == 0 {
+                try Task.checkCancellation()
+                progress(0.55 + 0.43 * Double(t) / Double(frames))
+            }
+            Self.melodyWeights(&melodyWeight, f0: melody[t], binHz: binHz, maxHz: parameters.melodyMaxHarmonicHz)
+            let base = t * bins
+            for k in 0..<bins {
+                let h = harmonic[base + k]
+                let p = percussive[base + k]
+                let h2 = h * h
+                let p2 = p * p
+                let total = h2 + p2
+                let drumShare: Float = total > 1e-12 ? p2 / total : 0
+                let tonal = 1 - drumShare
+                masks[0][k] = drumShare
+                masks[1][k] = tonal * bassWeight[k]
+                masks[2][k] = tonal * (1 - bassWeight[k]) * melodyWeight[k]
+            }
+            let start = t * hop - fftSize / 2
+            for (channelIndex, channel) in channels.enumerated() {
+                Self.fillFrame(&frameBuffer, from: channel, frameCount: frameCount, start: start, window: window)
+                fft.forward(frameBuffer, real: &re, imag: &im)
+                for stem in 0..<extracted.count {
+                    let mask = masks[stem]
+                    for k in 0..<bins {
+                        maskedRe[k] = re[k] * mask[k]
+                        maskedIm[k] = im[k] * mask[k]
+                    }
+                    fft.inverse(real: maskedRe, imag: maskedIm, output: &timeSignal)
+                    let lower = max(0, -start)
+                    let upper = min(fftSize, frameCount - start)
+                    if lower < upper {
+                        outputs[stem][channelIndex].withUnsafeMutableBufferPointer { output in
+                            for i in lower..<upper {
+                                output[start + i] += timeSignal[i] * window[i]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 窓の二乗の重なりで割って振幅を戻す。
+        let normalization = Self.windowSquareSum(window: window, hop: hop, frames: frames, frameCount: frameCount)
+        for stem in 0..<extracted.count {
+            for channelIndex in channels.indices {
+                for i in 0..<frameCount {
+                    let n = normalization[i]
+                    outputs[stem][channelIndex][i] = n > 1e-6 ? outputs[stem][channelIndex][i] / n : 0
+                }
+            }
+        }
+        var stems = [StemKind: [[Float]]]()
+        for (index, kind) in extracted.enumerated() {
+            stems[kind] = outputs[index]
+        }
+        // コード(伴奏)は残り。全パートの和が元の音と一致する。
+        stems[.chords] = channels.enumerated().map { channelIndex, channel in
+            var rest = [Float](repeating: 0, count: frameCount)
+            for i in 0..<frameCount {
+                rest[i] = channel[i] - outputs[0][channelIndex][i] - outputs[1][channelIndex][i] - outputs[2][channelIndex][i]
+            }
+            return rest
+        }
+        progress(1)
+        return StemSet(
+            method: .spectral,
+            detail: "HPSS + 帯域 + 音高追跡(FFT \(fftSize))",
+            sampleRate: sampleRate,
+            frameCount: frameCount,
+            stems: stems
+        )
+    }
+
+    // MARK: - Melody
+
+    /// フレームごとの主旋律の基本周波数(無声なら nil)。
+    func trackMelody(harmonic: [Float], frames: Int, bins: Int, binHz: Double, frameRate: Double) throws -> [Double?] {
+        let p = parameters
+        let steps = max(1, p.stepsPerSemitone)
+        let lowMidi = 69 + 12 * log2(p.melodyLowestHz / 440)
+        let highMidi = 69 + 12 * log2(p.melodyHighestHz / 440)
+        let candidateCount = max(1, Int(((highMidi - lowMidi) * Double(steps)).rounded(.down)) + 1)
+        let frequencies = (0..<candidateCount).map { 440 * pow(2, (lowMidi + Double($0) / Double(steps) - 69) / 12) }
+        let harmonicWeights = (0..<p.salienceHarmonics).map { Float(pow(0.85, Double($0))) }
+
+        // 候補ごとに、各倍音を探すビンの範囲を前もって求める。
+        struct Probe { var lower: Int; var upper: Int; var weight: Float }
+        let probes: [[Probe]] = frequencies.map { f0 in
+            (0..<p.salienceHarmonics).compactMap { index -> Probe? in
+                let f = f0 * Double(index + 1)
+                guard f < 5_000, f / binHz < Double(bins - 1) else { return nil }
+                let center = f / binHz
+                let spread = max(1.0, center * 0.03)
+                return Probe(
+                    lower: max(0, Int((center - spread).rounded(.down))),
+                    upper: min(bins - 1, Int((center + spread).rounded(.up))),
+                    weight: harmonicWeights[index]
+                )
+            }
+        }
+        let levelLower = max(1, Int(p.melodyLowestHz / binHz))
+        let levelUpper = min(bins - 1, Int(5_000 / binHz))
+
+        var salience = [Float](repeating: 0, count: frames * candidateCount)
+        var levels = [Float](repeating: 0, count: frames)
+        var peaky = [Bool](repeating: false, count: frames)
+        var frameMaxima = [Float](repeating: 0, count: frames)
+        var compressed = [Float](repeating: 0, count: bins)
+        for t in 0..<frames {
+            if t % 256 == 0 { try Task.checkCancellation() }
+            let base = t * bins
+            var level: Float = 0
+            for k in 0..<bins {
+                compressed[k] = harmonic[base + k].squareRoot()
+            }
+            if levelLower <= levelUpper {
+                for k in levelLower...levelUpper { level += harmonic[base + k] }
+            }
+            levels[t] = level
+            var maxValue: Float = 0
+            var sum: Float = 0
+            for c in 0..<candidateCount {
+                var value: Float = 0
+                var fundamental: Float = 0
+                var strongest: Float = 0
+                for (index, probe) in probes[c].enumerated() {
+                    var peak: Float = 0
+                    for k in probe.lower...probe.upper where compressed[k] > peak { peak = compressed[k] }
+                    value += probe.weight * peak
+                    if index == 0 { fundamental = peak }
+                    strongest = max(strongest, peak)
+                }
+                // 基本音が弱い候補を下げ、1 オクターブ下などの誤検出を防ぐ。
+                if strongest > 0 {
+                    value *= (fundamental / strongest).squareRoot()
+                }
+                salience[t * candidateCount + c] = value
+                maxValue = max(maxValue, value)
+                sum += value
+            }
+            let mean = sum / Float(candidateCount)
+            peaky[t] = mean > 0 && maxValue / mean >= p.voicingPeakRatio
+            frameMaxima[t] = maxValue
+        }
+
+        // 有声の判定: 十分な大きさがあり、倍音の和にはっきりした山があるフレーム。
+        let sortedLevels = levels.sorted()
+        let reference = sortedLevels.isEmpty ? 0 : sortedLevels[min(sortedLevels.count - 1, Int(Double(sortedLevels.count) * 0.95))]
+        let sortedMaxima = frameMaxima.sorted()
+        let salienceReference = sortedMaxima.isEmpty ? 0 : sortedMaxima[min(sortedMaxima.count - 1, Int(Double(sortedMaxima.count) * 0.95))]
+        var voiced = (0..<frames).map {
+            reference > 0 && levels[$0] > reference * p.voicingLevelRatio
+                && peaky[$0]
+                && frameMaxima[$0] >= salienceReference * p.voicingSalienceRatio
+        }
+        Self.removeShortRuns(&voiced, minimumLength: max(1, Int((p.minimumVoicedDuration * frameRate).rounded())))
+
+        // 有声区間ごとに、跳躍を抑えた最適な音高の列を動的計画法で求める。
+        var result = [Double?](repeating: nil, count: frames)
+        var t = 0
+        while t < frames {
+            guard voiced[t] else { t += 1; continue }
+            var end = t
+            while end < frames && voiced[end] { end += 1 }
+            let path = viterbi(salience: salience, candidates: candidateCount, from: t, to: end)
+            for (offset, candidate) in path.enumerated() {
+                result[t + offset] = frequencies[candidate]
+            }
+            t = end
+        }
+        return result
+    }
+
+    private func viterbi(salience: [Float], candidates: Int, from start: Int, to end: Int) -> [Int] {
+        let length = end - start
+        guard length > 0 else { return [] }
+        let penalty = parameters.jumpPenalty
+        var back = [Int32](repeating: 0, count: length * candidates)
+        func emission(_ t: Int) -> [Float] {
+            let base = t * candidates
+            var maxValue: Float = 0
+            for c in 0..<candidates { maxValue = max(maxValue, salience[base + c]) }
+            let scale = maxValue > 0 ? 1 / maxValue : 0
+            return (0..<candidates).map { log(salience[base + $0] * scale + 1e-3) }
+        }
+        var score = emission(start)
+        var next = [Float](repeating: 0, count: candidates)
+        for offset in stride(from: 1, to: length, by: 1) {
+            let e = emission(start + offset)
+            for c in 0..<candidates {
+                var best = -Float.infinity
+                var bestIndex = 0
+                for previous in 0..<candidates {
+                    let value = score[previous] - penalty * Float(abs(c - previous))
+                    if value > best {
+                        best = value
+                        bestIndex = previous
+                    }
+                }
+                next[c] = best + e[c]
+                back[offset * candidates + c] = Int32(bestIndex)
+            }
+            swap(&score, &next)
+        }
+        var path = [Int](repeating: 0, count: length)
+        var current = score.indices.max { score[$0] < score[$1] } ?? 0
+        for offset in stride(from: length - 1, through: 0, by: -1) {
+            path[offset] = current
+            if offset > 0 { current = Int(back[offset * candidates + current]) }
+        }
+        return path
+    }
+
+    static func removeShortRuns(_ flags: inout [Bool], minimumLength: Int) {
+        var t = 0
+        while t < flags.count {
+            guard flags[t] else { t += 1; continue }
+            var end = t
+            while end < flags.count && flags[end] { end += 1 }
+            if end - t < minimumLength {
+                for i in t..<end { flags[i] = false }
+            }
+            t = end
+        }
+    }
+
+    /// 基本周波数 `f0` の倍音の位置を 1 とする重み(ガウス形)。
+    static func melodyWeights(_ weights: inout [Float], f0: Double?, binHz: Double, maxHz: Double) {
+        for k in weights.indices { weights[k] = 0 }
+        guard let f0, f0 > 0 else { return }
+        var harmonic = 1
+        while true {
+            let center = f0 * Double(harmonic)
+            if center > maxHz || center / binHz >= Double(weights.count - 1) { break }
+            let sigma = max(binHz * 0.8, center * 0.012)
+            let lower = max(0, Int(((center - 3 * sigma) / binHz).rounded(.down)))
+            let upper = min(weights.count - 1, Int(((center + 3 * sigma) / binHz).rounded(.up)))
+            if lower <= upper {
+                for k in lower...upper {
+                    let d = (Double(k) * binHz - center) / sigma
+                    let w = Float(exp(-0.5 * d * d))
+                    if w > weights[k] { weights[k] = w }
+                }
+            }
+            harmonic += 1
+        }
+    }
+
+    // MARK: - Helpers
+
+    static func fillFrame(_ buffer: inout [Float], from samples: [Float], frameCount: Int, start: Int, window: [Float]) {
+        let size = buffer.count
+        if start >= 0 && start + size <= frameCount {
+            for i in 0..<size { buffer[i] = samples[start + i] * window[i] }
+        } else {
+            for i in 0..<size {
+                let index = start + i
+                buffer[i] = (index >= 0 && index < frameCount) ? samples[index] * window[i] : 0
+            }
+        }
+    }
+
+    static func windowSquareSum(window: [Float], hop: Int, frames: Int, frameCount: Int) -> [Float] {
+        let size = window.count
+        var sum = [Float](repeating: 0, count: frameCount)
+        for t in 0..<frames {
+            let start = t * hop - size / 2
+            let lower = max(0, -start)
+            let upper = min(size, frameCount - start)
+            guard lower < upper else { continue }
+            for i in lower..<upper {
+                sum[start + i] += window[i] * window[i]
+            }
+        }
+        return sum
+    }
+
+    /// 時間方向のメディアンフィルタ(端は範囲を狭める)。
+    static func medianOverTime(
+        _ values: [Float],
+        frames: Int,
+        bins: Int,
+        length: Int,
+        progress: (Double) -> Void
+    ) throws -> [Float] {
+        var result = [Float](repeating: 0, count: values.count)
+        let half = max(0, length / 2)
+        var column = [Float](repeating: 0, count: frames)
+        var window = [Float](repeating: 0, count: 2 * half + 1)
+        for k in 0..<bins {
+            if k % 64 == 0 {
+                try Task.checkCancellation()
+                progress(Double(k) / Double(bins))
+            }
+            for t in 0..<frames { column[t] = values[t * bins + k] }
+            for t in 0..<frames {
+                let lower = max(0, t - half)
+                let upper = min(frames - 1, t + half)
+                let count = upper - lower + 1
+                for i in 0..<count { window[i] = column[lower + i] }
+                result[t * bins + k] = median(&window, count: count)
+            }
+        }
+        return result
+    }
+
+    /// 周波数方向のメディアンフィルタ(フレームごと、その場で置き換える)。
+    static func medianOverFrequencyInPlace(_ values: inout [Float], frames: Int, bins: Int, length: Int) throws {
+        let half = max(0, length / 2)
+        var row = [Float](repeating: 0, count: bins)
+        var window = [Float](repeating: 0, count: 2 * half + 1)
+        for t in 0..<frames {
+            if t % 256 == 0 { try Task.checkCancellation() }
+            let base = t * bins
+            for k in 0..<bins { row[k] = values[base + k] }
+            for k in 0..<bins {
+                let lower = max(0, k - half)
+                let upper = min(bins - 1, k + half)
+                let count = upper - lower + 1
+                for i in 0..<count { window[i] = row[lower + i] }
+                values[base + k] = median(&window, count: count)
+            }
+        }
+    }
+
+    /// 先頭 `count` 個の中央値(挿入ソート。並びは変わる)。
+    static func median(_ values: inout [Float], count: Int) -> Float {
+        guard count > 0 else { return 0 }
+        for i in 1..<max(1, count) {
+            let value = values[i]
+            var j = i - 1
+            while j >= 0 && values[j] > value {
+                values[j + 1] = values[j]
+                j -= 1
+            }
+            values[j + 1] = value
+        }
+        if count % 2 == 1 { return values[count / 2] }
+        return (values[count / 2 - 1] + values[count / 2]) / 2
+    }
+}

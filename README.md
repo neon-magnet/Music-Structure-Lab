@@ -17,6 +17,7 @@ macOS 向けの音楽解析・作曲支援アプリケーションです。音�
 | プロジェクトの保存・読み込み (.mslab) | ✅ 実装済み |
 | 書き出し (JSON / CSV / MIDI / Audacity ラベル / コード譜 / 選択範囲の WAV) | ✅ 実装済み |
 | ループ再生・クリック音 | ✅ 実装済み |
+| パート分離 (ドラム / ベース / コード / メロディ) と個別再生 | ✅ 近似分離 (信号処理) は実装済み。機械学習モデルでの分離は、利用者が Core ML モデルを用意した場合のみ ([docs/STEM_MODEL.md](docs/STEM_MODEL.md)) |
 
 解析は信号処理による推定なので、間違えることがあります。結果はすべて手で直せるようにしています。
 
@@ -69,6 +70,21 @@ FFT は Apple プラットフォームでは Accelerate (vDSP) を使います�
   - コード譜 (テキスト)
   - 選択範囲 (セクション・コード区間) の音声 (WAV 24bit)
 
+### パート分離と個別再生
+
+ツールバーの「パート分離」、メニューの 解析 > パートを分離 (⌥⌘P)、またはインスペクタの「パート」タブから実行します。曲を ドラム・ベース・コード(伴奏)・メロディ の 4 つに分け、パートごとの音量・ミュート (M)・ソロ (S)・「このパートだけを聴く」で別々に再生できます。波形表示を「パート別」にすると、パートごとの波形を並べて表示します。4 つのパートは WAV で書き出せます。
+
+分離の方法は 2 つあり、画面に常にどちらで分離したかを表示します。
+
+| 方法 | 内容 |
+| --- | --- |
+| 近似分離 (信号処理、標準) | STFT の振幅にメディアンフィルタをかけて打楽器成分と持続音成分に分け (HPSS)、打楽器成分をドラム、持続音成分の低域 (180〜300Hz 以下) をベース、主旋律の音高を追って (倍音の重み付き和 + 跳躍を抑える動的計画法) その倍音をメロディ、残りをコード(伴奏) にします。全パートの和は元の音と一致します。**パート間の漏れが大きい簡易的な方法で、楽器ごとの本当の分離ではありません。** |
+| 機械学習モデル | 利用者が用意した Core ML モデル (Demucs 系) で分離します。モデルは同梱していません。`drums`→ドラム、`bass`→ベース、`vocals`→メロディ、それ以外→コード(伴奏)。モデルの形式と、Demucs からの変換スクリプト (未検証) は [docs/STEM_MODEL.md](docs/STEM_MODEL.md) を参照。モデルが無い時は近似分離になります。 |
+
+- 分離はバックグラウンドで行い、進捗表示と中止ができます。分離中も再生できます。
+- 分離したパートはメモリ上に持ちます (ステレオ 4 分の曲で約 350MB)。プロジェクトには保存しないので、開き直した時は分離し直します。
+- パートは別々の AVAudioPlayerNode で同じ時刻から鳴らすので、ずれません。音量・ミュート・ソロは再生中にすぐ反映されます。クリック音はパートのミュートの影響を受けません。
+
 ### 波形表示
 
 - 多段解像度のピーク (min/max) を読み込み時に作るので、長い曲でも全体表示・拡大表示が軽く動きます。
@@ -85,6 +101,7 @@ FFT は Apple プラットフォームでは Accelerate (vDSP) を使います�
 | ⌘R | 解析 / 解析し直す |
 | ⌘K / ⌥⌘K | カーソル位置でセクション / コードを分割 |
 | ⌘J | 選択を次と結合 |
+| ⌥⌘P | パートを分離 |
 | ⌘S / ⇧⌘S | 保存 / 別名で保存 |
 | ドラッグ / 横スクロール / マウスホイール | 左右に移動 |
 | ⌘ または ⌥ + スクロール、ピンチ | ポインタ位置を中心に拡大・縮小 |
@@ -123,18 +140,21 @@ Sources/
   MSLCore/            プラットフォーム非依存のモデルと解析ロジック
     Analysis/         解析 (MusicAnalyzer, Rhythm, Harmony, Structure, Features, DSP/FFT・Spectrogram)、
                       解析結果のモデルと編集操作 (AnalysisModels, AnalysisEditing)、音楽理論 (MusicTheory)
+    Separation/       パート分離 (SpectralStemSeparator, RealFFT)、パートとミキサーのモデル (Stems)
     Export/           書き出し (MIDIExporter, AnalysisExporters)
     Project/          プロジェクトファイル (ProjectDocument)
     Audio/            DecodedAudio, AudioFileInfo
     Waveform/         多段解像度の波形ピーク (WaveformBuilder / WaveformOverview)
     Timeline/         表示範囲の計算 (WaveformViewport)、時間の書式
-  MSLAudio/           AVFoundation による音源デコード (AudioFileLoader)、再生 (AudioPlayer)、WAV 書き出し (AudioExporter)
+  MSLAudio/           AVFoundation による音源デコード (AudioFileLoader)、再生 (AudioPlayer、パート別の同時再生)、
+                      WAV 書き出し (AudioExporter)、Core ML モデルでのパート分離 (MLStemSeparator)
   MusicStructureLab/  SwiftUI アプリ本体
     Models/           AudioDocumentModel (読み込み・再生・解析・編集・保存の状態)
-    Views/            画面 (ContentView, WaveformPanel, AnalysisLanes, InspectorView, 描画ビュー)
+    Views/            画面 (ContentView, WaveformPanel, AnalysisLanes, InspectorView, StemMixerView, 描画ビュー)
 Tests/
-  MSLCoreTests/       波形ピーク・表示範囲・時間書式・解析 (合成音源)・編集・書き出し・プロジェクトのテスト
+  MSLCoreTests/       波形ピーク・表示範囲・時間書式・解析 (合成音源)・編集・書き出し・プロジェクト・パート分離 (合成音源) のテスト
   MSLAudioTests/      実際に WAV を書き出して読み込むテスト、再生バッファのテスト
+tools/                Demucs を Core ML に変換するスクリプト (未検証)
 project.yml           XcodeGen 用の .app 定義
 ```
 

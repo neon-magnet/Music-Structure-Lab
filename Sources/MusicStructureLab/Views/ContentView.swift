@@ -80,17 +80,34 @@ struct ContentView: View {
                 .disabled(model.audio == nil || model.isAnalyzing)
                 .help(model.analysis == nil ? "解析を実行 (⌘R)" : "解析し直す (⌘R)")
 
+                Button {
+                    model.separateStems()
+                } label: {
+                    if model.isSeparating {
+                        Label("分離中 \(Int((model.separationProgress * 100).rounded()))%", systemImage: "hourglass")
+                    } else {
+                        Label("パート分離", systemImage: "square.3.layers.3d")
+                    }
+                }
+                .disabled(model.audio == nil || model.isSeparating)
+                .help(model.isSeparating
+                    ? "パートを分離しています(\(Int((model.separationProgress * 100).rounded()))%)。インスペクタの「パート」で中止できます"
+                    : "ドラム・ベース・コード・メロディに分離する")
+
                 Menu {
                     ForEach(ExportFormat.allCases) { format in
                         Button(format.title + "…") { model.export(format) }
+                        .disabled(model.analysis == nil)
                     }
                     Divider()
                     Button("選択範囲の音声 (WAV)…") { model.exportSelectionAudio() }
                         .disabled(model.selectionRange == nil)
+                    Button("分離したパート (WAV)…") { model.exportStems() }
+                        .disabled(model.stems == nil)
                 } label: {
                     Label("書き出し", systemImage: "square.and.arrow.up")
                 }
-                .disabled(model.analysis == nil)
+                .disabled(model.analysis == nil && model.stems == nil)
                 .help("解析結果を書き出す")
 
                 Button {

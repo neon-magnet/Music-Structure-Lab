@@ -20,6 +20,8 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: app.musicstructurelab.MSLCore
+        # 解析・パート分離は計算量が多いので、Debug ビルドでも最適化する。
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
   MSLAudio:
     type: framework
     platform: macOS
@@ -28,6 +30,7 @@ targets:
     dependencies:
       - target: MSLCore
       - sdk: AVFoundation.framework
+      - sdk: CoreML.framework
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

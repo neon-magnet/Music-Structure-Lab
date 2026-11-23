@@ -2,7 +2,7 @@ import AppKit
 import MSLCore
 import SwiftUI
 
-/// 右側のインスペクタ。解析結果の確認と編集、セクション一覧、コード譜、メモ。
+/// 右側のインスペクタ。解析結果の確認と編集、セクション一覧、コード譜、パート分離、メモ。
 struct InspectorView: View {
     @EnvironmentObject private var model: AudioDocumentModel
 
@@ -10,6 +10,7 @@ struct InspectorView: View {
         case edit
         case sections
         case chart
+        case stems
         case notes
 
         var id: String { rawValue }
@@ -19,6 +20,7 @@ struct InspectorView: View {
             case .edit: return "編集"
             case .sections: return "構成"
             case .chart: return "コード譜"
+            case .stems: return "パート"
             case .notes: return "メモ"
             }
         }
@@ -62,6 +64,8 @@ struct InspectorView: View {
                 SectionListView()
             case .chart:
                 ChordChartView()
+            case .stems:
+                StemMixerView()
             case .notes:
                 NotesView()
             }

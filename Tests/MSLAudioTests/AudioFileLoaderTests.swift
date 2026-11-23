@@ -99,6 +99,16 @@ final class AudioFileLoaderTests: XCTestCase {
         XCTAssertThrowsError(try AudioExporter.writeWAV(audio, frames: 50_000..<60_000, to: exported))
     }
 
+    func testExportedStemChannelsCanBeReadBack() throws {
+        let exported = directory.appendingPathComponent("stem.wav")
+        let left = (0..<8_000).map { Float(sin(Double($0) * 0.05)) * 0.5 }
+        try AudioExporter.writeWAV(channels: [left, left], sampleRate: 44_100, frames: 0..<8_000, to: exported)
+        let reloaded = try AudioFileLoader().load(from: exported)
+        XCTAssertEqual(reloaded.info.frameCount, 8_000)
+        XCTAssertEqual(reloaded.info.channelCount, 2)
+        XCTAssertEqual(reloaded.channels[0][100], left[100], accuracy: 1e-4)
+    }
+
     func testReportsProgressUpToCompletion() throws {
         let url = try writeTestWAV(name: "progress.wav", sampleRate: 48_000, frames: 48_000)
         let recorder = ProgressRecorder()

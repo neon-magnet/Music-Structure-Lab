@@ -65,4 +65,39 @@ final class AudioPlayerBufferTests: XCTestCase {
         XCTAssertEqual(data[0][0], audio.mono[0], accuracy: 1e-6)
         XCTAssertEqual(data[0][1], audio.mono[1], accuracy: 1e-6)
     }
+
+    func testBufferFromStemChannels() throws {
+        let audio = makeAudio(channels: [[0, 0, 0, 0], [0, 0, 0, 0]])
+        let format = try XCTUnwrap(AudioPlayer.playbackFormat(for: audio))
+        let stem: [[Float]] = [[0.1, 0.2, 0.3, 0.4], [-0.1, -0.2, -0.3, -0.4]]
+        let buffer = try XCTUnwrap(AudioPlayer.makeBuffer(channels: stem, frameCount: 4, format: format, startFrame: 1, endFrame: 3))
+        XCTAssertEqual(buffer.frameLength, 2)
+        let data = try XCTUnwrap(buffer.floatChannelData)
+        XCTAssertEqual(data[0][0], 0.2)
+        XCTAssertEqual(data[1][1], -0.3)
+        // チャンネル数が合わなければ作らない。
+        XCTAssertNil(AudioPlayer.makeBuffer(channels: [stem[0]], frameCount: 4, format: format, startFrame: 0))
+    }
+
+    func testPlaybackChannelsMatchFormat() {
+        let stereo = makeAudio(channels: [[0.1], [0.2]])
+        XCTAssertEqual(AudioPlayer.playbackChannels(for: stereo).count, 2)
+        let surround = makeAudio(channels: [[0.3], [0.6], [0.0]])
+        XCTAssertEqual(AudioPlayer.playbackChannels(for: surround).count, 1)
+    }
+
+    func testModelSourcesMapToStems() {
+        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "drums"), .drums)
+        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "bass"), .bass)
+        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "vocals"), .melody)
+        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "other"), .chords)
+        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "piano"), .chords)
+    }
+
+    func testResampleChangesLength() throws {
+        let input = (0..<48_000).map { Float(sin(2 * Double.pi * 440 * Double($0) / 48_000)) * 0.5 }
+        let output = try MLStemSeparator.resample([input, input], from: 48_000, to: 44_100)
+        XCTAssertEqual(output.count, 2)
+        XCTAssertEqual(Double(output[0].count), 44_100, accuracy: 600)
+    }
 }

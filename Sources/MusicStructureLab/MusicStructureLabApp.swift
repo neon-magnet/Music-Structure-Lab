@@ -44,12 +44,15 @@ struct FileCommands: Commands {
             Menu("書き出し") {
                 ForEach(ExportFormat.allCases) { format in
                     Button(format.title + "…") { model.export(format) }
+                        .disabled(model.analysis == nil)
                 }
                 Divider()
                 Button("選択範囲の音声 (WAV)…") { model.exportSelectionAudio() }
                     .disabled(model.selectionRange == nil)
+                Button("分離したパート (WAV)…") { model.exportStems() }
+                    .disabled(model.stems == nil)
             }
-            .disabled(model.analysis == nil)
+            .disabled(model.analysis == nil && model.stems == nil)
             Divider()
             Button("閉じる") { model.close() }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
@@ -68,6 +71,12 @@ struct AnalysisCommands: Commands {
                 .disabled(model.audio == nil || model.isAnalyzing)
             Button("解析を中止") { model.cancelAnalysis() }
                 .disabled(!model.isAnalyzing)
+            Divider()
+            Button(model.stems == nil ? "パートを分離" : "パートを分離し直す") { model.separateStems() }
+                .keyboardShortcut("p", modifiers: [.command, .option])
+                .disabled(model.audio == nil || model.isSeparating)
+            Button("パート分離を中止") { model.cancelSeparation() }
+                .disabled(!model.isSeparating)
             Divider()
             Button("カーソル位置でセクションを分割") { model.splitSectionAtCursor() }
                 .keyboardShortcut("k")
@@ -110,6 +119,16 @@ struct PlaybackCommands: Commands {
             Toggle("クリック音", isOn: $model.isClickEnabled)
                 .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(model.analysis == nil)
+            Toggle("パート別に再生", isOn: $model.isStemPlaybackEnabled)
+                .disabled(model.stems == nil)
+            Menu("パートだけを聴く") {
+                ForEach(StemKind.allCases) { kind in
+                    Button(kind.displayName) { model.soloOnly(kind) }
+                }
+                Divider()
+                Button("すべてのパートを聴く") { model.stemMix = StemMix() }
+            }
+            .disabled(model.stems == nil || !model.isStemPlaybackEnabled)
         }
     }
 }

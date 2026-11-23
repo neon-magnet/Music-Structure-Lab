@@ -50,7 +50,7 @@ struct WaveformCanvasView: View {
         let pixel = 1 / scale
         let midY = rect.midY
         let amplitude = rect.height / 2 * 0.92
-        let waveColor = Color.accentColor
+        let waveColor = lane.color.opacity(lane.opacity)
 
         // 0 の基準線と ±1.0 の目安線
         context.fill(Path(CGRect(x: 0, y: midY - pixel / 2, width: rect.width, height: pixel)),

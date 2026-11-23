@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
 enum WaveformDisplayMode: String, CaseIterable, Identifiable {
     case channels
     case mix
+    /// 分離したパートごと。
+    case stems
 
     var id: String { rawValue }
 
@@ -15,6 +17,7 @@ enum WaveformDisplayMode: String, CaseIterable, Identifiable {
         switch self {
         case .channels: return "チャンネル別"
         case .mix: return "ミックス"
+        case .stems: return "パート別"
         }
     }
 }
@@ -67,6 +70,26 @@ final class AudioDocumentModel: ObservableObject {
     @Published private(set) var analysisProgress: Double = 0
     @Published var selection: Selection?
 
+    // MARK: Stems
+
+    /// 分離したパート。プロジェクトには保存しない(必要なら分離し直す)。
+    @Published var stems: StemSet?
+    @Published var isSeparating = false
+    @Published var separationProgress: Double = 0
+    /// 次に分離する時の方法。モデルが無い時は近似分離になる。
+    @Published var separationMethod: SeparationMethod = .spectral
+    /// パートごとの音量・ミュート・ソロ。
+    @Published var stemMix = StemMix() {
+        didSet { applyStemGains() }
+    }
+    /// 分離したパートを鳴らす(オフなら元の音源を鳴らす)。
+    @Published var isStemPlaybackEnabled = false {
+        didSet {
+            if isStemPlaybackEnabled != oldValue { updatePlayerVoices() }
+        }
+    }
+    let stemModelStore: StemModelStore
+
     // MARK: Project
 
     @Published var notes = "" {
@@ -88,6 +111,8 @@ final class AudioDocumentModel: ObservableObject {
     private var loadToken = UUID()
     private var analysisTask: Task<Void, Never>?
     private var analysisToken = UUID()
+    var separationTask: Task<Void, Never>?
+    var separationToken = UUID()
     /// プロジェクトを開いた時、音源の読み込み後に適用する内容。
     private var pendingProject: (document: ProjectDocument, url: URL)?
     /// ドラッグ中の編集の開始時点(確定時に 1 回だけ取り消しを登録する)。
@@ -95,6 +120,7 @@ final class AudioDocumentModel: ObservableObject {
 
     init() {
         player = AudioPlayer()
+        stemModelStore = StemModelStore()
         player.onFinished = { [weak self] in
             guard let self else { return }
             self.playbackStopped(at: self.player.currentFrame)
@@ -139,6 +165,7 @@ final class AudioDocumentModel: ObservableObject {
     func openAudio(url: URL) {
         pause()
         cancelAnalysis()
+        cancelSeparation()
         loadTask?.cancel()
         let token = UUID()
         loadToken = token
@@ -184,11 +211,13 @@ final class AudioDocumentModel: ObservableObject {
     func closeWithoutConfirmation() {
         cancelLoading()
         cancelAnalysis()
+        cancelSeparation()
         stopPlayheadTimer()
         player.unload()
         isPlaying = false
         audio = nil
         analysis = nil
+        clearStems()
         selection = nil
         cursorFrame = nil
         projectURL = nil
@@ -209,6 +238,7 @@ final class AudioDocumentModel: ObservableObject {
         stopPlayheadTimer()
         isPlaying = false
         player.load(decoded)
+        clearStems()
         releaseAudioAccess()
         audioURL = url
         // サンドボックスでも保存時にブックマークを作れるよう、開いている間はアクセス権を保つ。
