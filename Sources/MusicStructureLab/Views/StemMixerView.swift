@@ -22,7 +22,7 @@ private struct StemMixerContent: View {
                 if let stems = model.stems {
                     mixer(stems)
                 } else if !model.isSeparating {
-                    Text("まだ分離していません。「分離する」を押すと、ドラム・ベース・コード(伴奏)・メロディの 4 つに分けて、別々に再生できるようになります。")
+                    Text("まだ分離していません。「分離する」を押すと、ドラム・ベース・コード(伴奏)・ボーカル・メロディの 5 つに分けて、別々に再生できるようになります。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -137,7 +137,7 @@ private struct StemMixerContent: View {
                 Button("ミュート・ソロを解除") { model.stemMix = StemMix() }
                 Spacer()
                 Button("WAV で書き出す…") { model.exportStems() }
-                    .help("4 つのパートをそれぞれ WAV ファイルに書き出す")
+                    .help("5 つのパートをそれぞれ WAV ファイルに書き出す")
             }
             .controlSize(.small)
         }
@@ -194,6 +194,12 @@ private struct StemRow: View {
                     .font(.caption)
                     .monospacedDigit()
                     .frame(width: 38, alignment: .trailing)
+            }
+            if let reason = model.stems?.unavailable[kind] {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(8)

@@ -144,6 +144,9 @@ final class SpectralStemSeparatorTests: XCTestCase {
         // ステレオ(左右同じ)で渡す。
         let result = try SpectralStemSeparator().separate(channels: [mix, mix], sampleRate: sampleRate)
         XCTAssertEqual(result.method, .spectral)
+        // 左右が同じなのでボーカルは分けられない(無音になり、理由が付く)。
+        XCTAssertNotNil(result.unavailable[.vocals])
+        XCTAssertTrue(result.channels(for: .vocals)[0].allSatisfy { $0 == 0 })
         XCTAssertEqual(result.frameCount, count)
         for kind in StemKind.allCases {
             XCTAssertEqual(result.channels(for: kind).count, 2)
@@ -164,6 +167,65 @@ final class SpectralStemSeparatorTests: XCTestCase {
         XCTAssertGreaterThan(melody, 0.7, "melody \(melody)")
         XCTAssertGreaterThan(drums, 0.5, "drums \(drums)")
         XCTAssertGreaterThan(chords, 0.5, "chords \(chords)")
+    }
+
+    func testCenterChannelBecomesVocals() throws {
+        let count = Int(sampleRate * 4)
+        var vocal = [Float](repeating: 0, count: count)
+        var left = [Float](repeating: 0, count: count)
+        var right = [Float](repeating: 0, count: count)
+        let notes = [440.0, 493.88, 523.25, 587.33]
+        var phase = 0.0
+        for i in 0..<count {
+            let time = Double(i) / sampleRate
+            // ビブラートのかかった声(中央)と、左右に振った和音。
+            let frequency = notes[min(3, Int(time))] * (1 + 0.01 * sin(2 * Double.pi * 5 * time))
+            phase += 2 * Double.pi * frequency / sampleRate
+            var v = 0.0
+            for h in 0..<8 { v += 0.2 * pow(0.7, Double(h)) * sin(Double(h + 1) * phase) }
+            vocal[i] = Float(v)
+            var chord = 0.0
+            for f in [261.63, 329.63, 392.0] {
+                for h in 0..<4 { chord += 0.07 * pow(0.7, Double(h)) * sin(2 * Double.pi * f * Double(h + 1) * time) }
+            }
+            left[i] = vocal[i] + Float(0.9 * chord)
+            right[i] = vocal[i] + Float(0.3 * chord)
+        }
+        let result = try SpectralStemSeparator().separate(channels: [left, right], sampleRate: sampleRate)
+        XCTAssertNil(result.unavailable[.vocals])
+        let vocals = correlation(result.channels(for: .vocals)[0], vocal)
+        XCTAssertGreaterThan(vocals, 0.85, "vocals \(vocals)")
+        for (channelIndex, original) in [left, right].enumerated() {
+            for i in stride(from: 0, to: count, by: 101) {
+                let sum = StemKind.allCases.reduce(Float(0)) { $0 + result.channels(for: $1)[channelIndex][i] }
+                XCTAssertEqual(sum, original[i], accuracy: 1e-3)
+            }
+        }
+    }
+
+    func testOnlyRequestedPartsAreExtracted() throws {
+        let sources = makeSources(duration: 2)
+        let count = sources[.melody]!.count
+        var mix = [Float](repeating: 0, count: count)
+        for kind in [StemKind.melody, .chords] {
+            for i in 0..<count { mix[i] += sources[kind]![i] }
+        }
+        let result = try SpectralStemSeparator().separate(channels: [mix], sampleRate: sampleRate, parts: [.melody])
+        for kind in [StemKind.drums, .bass, .vocals] {
+            XCTAssertTrue(result.channels(for: kind)[0].allSatisfy { $0 == 0 }, "\(kind)")
+        }
+        XCTAssertGreaterThan(correlation(result.channels(for: .melody)[0], sources[.melody]!), 0.7)
+        for i in stride(from: 0, to: count, by: 97) {
+            let sum = result.channels(for: .melody)[0][i] + result.channels(for: .chords)[0][i]
+            XCTAssertEqual(sum, mix[i], accuracy: 1e-3)
+        }
+    }
+
+    func testCenterWeight() {
+        XCTAssertEqual(SpectralStemSeparator.centerWeight(leftRe: 1, leftIm: 0.5, rightRe: 1, rightIm: 0.5, exponent: 4), 1, accuracy: 1e-5)
+        XCTAssertEqual(SpectralStemSeparator.centerWeight(leftRe: 1, leftIm: 0, rightRe: 0, rightIm: 0, exponent: 4), 0, accuracy: 1e-5)
+        XCTAssertEqual(SpectralStemSeparator.centerWeight(leftRe: 1, leftIm: 0, rightRe: -1, rightIm: 0, exponent: 4), 0, accuracy: 1e-5)
+        XCTAssertEqual(SpectralStemSeparator.centerWeight(leftRe: 0, leftIm: 0, rightRe: 0, rightIm: 0, exponent: 4), 0)
     }
 
     func testMelodyTrackingFindsNotes() throws {

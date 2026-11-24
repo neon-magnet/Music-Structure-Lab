@@ -29,7 +29,8 @@ public enum MLSeparationError: LocalizedError {
 /// - サンプルレート: メタデータ `sample_rate`。無ければ 44100Hz。
 ///
 /// 曲全体の平均と標準偏差で正規化してから L ごとに区切って(25% 重ねて)推論し、重なりはなだらかにつなぐ。
-/// `vocals` を メロディ、`drums` を ドラム、`bass` を ベース、それ以外(other / guitar / piano など)を コード(伴奏) にまとめる。
+/// `vocals` を ボーカル、`drums` を ドラム、`bass` を ベース、それ以外(other / guitar / piano など)を コード(伴奏) にまとめる。
+/// モデルはメロディを出力しないので、コード(伴奏) から音高追跡で メロディ を近似的に取り出す(`SpectralStemSeparator`)。
 public final class MLStemSeparator {
     public let model: MLModel
     public let modelName: String
@@ -110,7 +111,7 @@ public final class MLStemSeparator {
         switch name {
         case "drums": return .drums
         case "bass": return .bass
-        case "vocals", "vocal", "voice": return .melody
+        case "vocals", "vocal", "voice": return .vocals
         default: return .chords
         }
     }
@@ -167,7 +168,7 @@ public final class MLStemSeparator {
         let chunkCount = length <= segment ? 1 : (length - overlap + stride - 1) / stride
         for chunk in 0..<chunkCount {
             try Task.checkCancellation()
-            progress(Double(chunk) / Double(chunkCount))
+            progress(0.85 * Double(chunk) / Double(chunkCount))
             let offset = chunk * stride
             for channel in 0..<2 {
                 for i in 0..<segment {
@@ -246,10 +247,23 @@ public final class MLStemSeparator {
         for kind in StemKind.allCases where stems[kind] == nil {
             stems[kind] = silent
         }
+
+        // メロディは、伴奏(other など)から音高追跡で取り出す。全パートの和は変わらない。
+        if let accompaniment = stems[.chords] {
+            let melodySplit = try SpectralStemSeparator().separate(
+                channels: accompaniment,
+                sampleRate: sampleRate,
+                parts: [.melody]
+            ) { value in
+                progress(0.85 + 0.15 * value)
+            }
+            stems[.melody] = melodySplit.channels(for: .melody)
+            stems[.chords] = melodySplit.channels(for: .chords)
+        }
         progress(1)
         return StemSet(
             method: .mlModel,
-            detail: "\(modelName)(\(sourceNames.joined(separator: ", ")))",
+            detail: "\(modelName)(\(sourceNames.joined(separator: ", ")))+ メロディは伴奏から音高追跡",
             sampleRate: sampleRate,
             frameCount: frameCount,
             stems: stems

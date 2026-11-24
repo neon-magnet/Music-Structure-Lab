@@ -11,6 +11,7 @@ enum StemPalette {
         case .drums: return Color(red: 0.90, green: 0.40, blue: 0.30)
         case .bass: return Color(red: 0.55, green: 0.40, blue: 0.90)
         case .chords: return Color(red: 0.25, green: 0.65, blue: 0.85)
+        case .vocals: return Color(red: 0.95, green: 0.60, blue: 0.20)
         case .melody: return Color(red: 0.30, green: 0.75, blue: 0.45)
         }
     }

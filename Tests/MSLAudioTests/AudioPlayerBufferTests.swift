@@ -89,7 +89,7 @@ final class AudioPlayerBufferTests: XCTestCase {
     func testModelSourcesMapToStems() {
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "drums"), .drums)
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "bass"), .bass)
-        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "vocals"), .melody)
+        XCTAssertEqual(MLStemSeparator.stemKind(forSource: "vocals"), .vocals)
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "other"), .chords)
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "piano"), .chords)
     }

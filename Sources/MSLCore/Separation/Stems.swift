@@ -5,6 +5,7 @@ public enum StemKind: String, CaseIterable, Codable, Identifiable, Sendable {
     case drums
     case bass
     case chords
+    case vocals
     case melody
 
     public var id: String { rawValue }
@@ -14,6 +15,7 @@ public enum StemKind: String, CaseIterable, Codable, Identifiable, Sendable {
         case .drums: return "ドラム"
         case .bass: return "ベース"
         case .chords: return "コード(伴奏)"
+        case .vocals: return "ボーカル"
         case .melody: return "メロディ"
         }
     }
@@ -23,7 +25,8 @@ public enum StemKind: String, CaseIterable, Codable, Identifiable, Sendable {
         case .drums: return "circle.grid.cross"
         case .bass: return "guitars"
         case .chords: return "pianokeys"
-        case .melody: return "music.mic"
+        case .vocals: return "music.mic"
+        case .melody: return "music.note"
         }
     }
 }
@@ -47,9 +50,9 @@ public enum SeparationMethod: String, Codable, CaseIterable, Identifiable, Senda
     public var explanation: String {
         switch self {
         case .spectral:
-            return "打楽器成分と持続音成分の分離・帯域・メロディの音高追跡で振り分ける簡易的な方法です。パート間の音の漏れが大きく、実際の楽器ごとの分離ではありません。"
+            return "打楽器成分と持続音成分の分離・帯域・中央定位(ボーカル)・メロディの音高追跡で振り分ける簡易的な方法です。パート間の音の漏れが大きく、実際の楽器ごとの分離ではありません。ボーカルには中央に置かれた楽器も入り、モノラル音源ではボーカルを分けられません。"
         case .mlModel:
-            return "読み込んだ Core ML モデルで分離します。モデルの「その他」を コード(伴奏)、「ボーカル」を メロディ として扱います。"
+            return "読み込んだ Core ML モデルで分離します。モデルの「ボーカル」をそのまま ボーカル に使います。メロディ は、モデルの「その他」から音高追跡で近似的に取り出し、残りを コード(伴奏) にします。"
         }
     }
 }
@@ -65,9 +68,19 @@ public struct StemSet: Sendable {
     public let stems: [StemKind: [[Float]]]
     /// パートごとの波形概要(モノラル)。
     public let overviews: [StemKind: WaveformOverview]
+    /// 分けられなかったパートと、その理由(そのパートは無音)。
+    public let unavailable: [StemKind: String]
 
-    public init(method: SeparationMethod, detail: String, sampleRate: Double, frameCount: Int, stems: [StemKind: [[Float]]]) {
+    public init(
+        method: SeparationMethod,
+        detail: String,
+        sampleRate: Double,
+        frameCount: Int,
+        stems: [StemKind: [[Float]]],
+        unavailable: [StemKind: String] = [:]
+    ) {
         self.method = method
+        self.unavailable = unavailable
         self.detail = detail
         self.sampleRate = sampleRate
         self.frameCount = frameCount

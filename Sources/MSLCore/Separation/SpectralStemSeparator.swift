@@ -6,11 +6,14 @@ import Foundation
 ///    持続音成分 H と打楽器成分 P を求める(HPSS, Fitzgerald 2010)。
 /// 2. 打楽器成分の割合 P²/(H²+P²) を ドラム に振り分ける。
 /// 3. 持続音成分のうち、低域(既定で 180Hz 以下、300Hz までなだらかに減らす)を ベース にする。
-/// 4. 持続音成分から主旋律の音高を追い(倍音の重み付き和 + 音高の跳躍を抑える動的計画法)、
-///    その倍音の周波数を メロディ にする。
-/// 5. 残りを コード(伴奏) にする(元の信号からほかのパートを引いて作るので、全パートの和は元の音と一致する)。
+/// 4. ステレオなら、残りの持続音成分のうち左右で同じ(中央に定位した)成分を ボーカル にする。
+///    左右の相関 2·Re(L·R̄)/(|L|²+|R|²) を 4 乗した重みを使う。中央に置かれた楽器も入る。
+/// 5. 持続音成分から主旋律の音高を追い(倍音の重み付き和 + 音高の跳躍を抑える動的計画法)、
+///    ボーカルに振り分けなかった分のうち、その倍音の周波数を メロディ にする。
+/// 6. 残りを コード(伴奏) にする(元の信号からほかのパートを引いて作るので、全パートの和は元の音と一致する)。
 ///
 /// あくまで近似で、パート間の漏れは大きい。ボーカルの子音はドラムに、低音の楽器はベースに入る。
+/// モノラル(または左右がほぼ同じ)の音源ではボーカルを分けられないので、ボーカルは無音になる。
 public struct SpectralStemSeparator: Sendable {
     public struct Parameters: Sendable {
         /// メディアンフィルタの長さ(フレーム数・ビン数。奇数)。
@@ -18,6 +21,10 @@ public struct SpectralStemSeparator: Sendable {
         public var percussiveMedianLength = 17
         public var bassFullBelow = 180.0
         public var bassNoneAbove = 300.0
+        /// ボーカルの重み(左右の相関)にかける指数。大きいほど中央のものだけを取る。
+        public var vocalCenterExponent: Float = 4
+        /// 左右の差の大きさが和のこの割合より小さければ、モノラルとみなしてボーカルを分けない。
+        public var monoSideRatio = 0.001
         public var melodyLowestHz = 150.0
         public var melodyHighestHz = 1_100.0
         /// メロディとして取り出す倍音の上限周波数。
@@ -40,6 +47,9 @@ public struct SpectralStemSeparator: Sendable {
         public init() {}
     }
 
+    /// 取り出せるパート(コード(伴奏) は常に残りになる)。
+    public static let extractableParts: [StemKind] = [.drums, .bass, .vocals, .melody]
+
     public var parameters: Parameters
 
     public init(parameters: Parameters = Parameters()) {
@@ -54,12 +64,28 @@ public struct SpectralStemSeparator: Sendable {
         return size
     }
 
+    /// 左右がほぼ同じ(実質モノラル)か。
+    func isEffectivelyMono(_ channels: [[Float]], frameCount: Int) -> Bool {
+        guard channels.count == 2 else { return true }
+        var mid = 0.0
+        var side = 0.0
+        for i in 0..<frameCount {
+            let l = Double(channels[0][i])
+            let r = Double(channels[1][i])
+            mid += (l + r) * (l + r)
+            side += (l - r) * (l - r)
+        }
+        return mid <= 0 || side < mid * parameters.monoSideRatio
+    }
+
     /// - Parameters:
     ///   - channels: 再生と同じチャンネル(モノラルかステレオ)。長さは揃っていること。
+    ///   - parts: 取り出すパート。含めなかったパートは無音になり、その分は コード(伴奏) に入る。
     ///   - progress: 0...1。
     public func separate(
         channels: [[Float]],
         sampleRate: Double,
+        parts: Set<StemKind> = Set(SpectralStemSeparator.extractableParts),
         progress: (Double) -> Void = { _ in }
     ) throws -> StemSet {
         let frameCount = channels.map(\.count).min() ?? 0
@@ -76,6 +102,25 @@ public struct SpectralStemSeparator: Sendable {
         let frames = frameCount / hop + 1
         let window = Window.hann(fftSize)
         let binHz = sampleRate / Double(fftSize)
+
+        var unavailable = [StemKind: String]()
+        var useVocals = parts.contains(.vocals)
+        if useVocals && isEffectivelyMono(channels, frameCount: frameCount) {
+            useVocals = false
+            unavailable[.vocals] = "モノラル(左右が同じ)の音源なので、近似分離ではボーカルを分けられません。"
+        }
+        let useDrums = parts.contains(.drums)
+        let useBass = parts.contains(.bass)
+        let useMelody = parts.contains(.melody)
+        let extracted = Self.extractableParts.filter { kind in
+            switch kind {
+            case .drums: return useDrums
+            case .bass: return useBass
+            case .vocals: return useVocals
+            case .melody: return useMelody
+            case .chords: return false
+            }
+        }
 
         // 1. モノラルの振幅スペクトログラム。
         var mono = [Float](repeating: 0, count: frameCount)
@@ -112,34 +157,49 @@ public struct SpectralStemSeparator: Sendable {
         progress(0.45)
 
         // 3. 主旋律の音高。
-        let melody = try trackMelody(harmonic: harmonic, frames: frames, bins: bins, binHz: binHz, frameRate: sampleRate / Double(hop))
+        let melody = try useMelody
+            ? trackMelody(harmonic: harmonic, frames: frames, bins: bins, binHz: binHz, frameRate: sampleRate / Double(hop))
+            : [Double?](repeating: nil, count: frames)
         progress(0.55)
 
         // 4. マスクをかけて逆変換する。
         let bassWeight = (0..<bins).map { k -> Float in
+            guard useBass else { return 0 }
             let f = Double(k) * binHz
             if f <= parameters.bassFullBelow { return 1 }
             if f >= parameters.bassNoneAbove { return 0 }
             let x = (f - parameters.bassFullBelow) / (parameters.bassNoneAbove - parameters.bassFullBelow)
             return Float(0.5 + 0.5 * cos(Double.pi * x))
         }
-        let extracted: [StemKind] = [.drums, .bass, .melody]
         var outputs = [[[Float]]](
             repeating: channels.map { _ in [Float](repeating: 0, count: frameCount) },
             count: extracted.count
         )
-        var masks = [[Float]](repeating: [Float](repeating: 0, count: bins), count: extracted.count)
+        var drumMask = [Float](repeating: 0, count: bins)
+        var bassMask = [Float](repeating: 0, count: bins)
+        var vocalMask = [Float](repeating: 0, count: bins)
+        var melodyMask = [Float](repeating: 0, count: bins)
         var melodyWeight = [Float](repeating: 0, count: bins)
+        var spectraRe = [[Float]](repeating: [Float](repeating: 0, count: bins), count: channels.count)
+        var spectraIm = [[Float]](repeating: [Float](repeating: 0, count: bins), count: channels.count)
         var maskedRe = [Float](repeating: 0, count: bins)
         var maskedIm = [Float](repeating: 0, count: bins)
         var timeSignal = [Float](repeating: 0, count: fftSize)
+        let exponent = parameters.vocalCenterExponent
 
         for t in 0..<frames {
             if t % 32 == 0 {
                 try Task.checkCancellation()
                 progress(0.55 + 0.43 * Double(t) / Double(frames))
             }
-            Self.melodyWeights(&melodyWeight, f0: melody[t], binHz: binHz, maxHz: parameters.melodyMaxHarmonicHz)
+            let start = t * hop - fftSize / 2
+            for channelIndex in channels.indices {
+                Self.fillFrame(&frameBuffer, from: channels[channelIndex], frameCount: frameCount, start: start, window: window)
+                fft.forward(frameBuffer, real: &spectraRe[channelIndex], imag: &spectraIm[channelIndex])
+            }
+            if useMelody {
+                Self.melodyWeights(&melodyWeight, f0: melody[t], binHz: binHz, maxHz: parameters.melodyMaxHarmonicHz)
+            }
             let base = t * bins
             for k in 0..<bins {
                 let h = harmonic[base + k]
@@ -147,21 +207,36 @@ public struct SpectralStemSeparator: Sendable {
                 let h2 = h * h
                 let p2 = p * p
                 let total = h2 + p2
-                let drumShare: Float = total > 1e-12 ? p2 / total : 0
+                let drumShare: Float = useDrums && total > 1e-12 ? p2 / total : 0
                 let tonal = 1 - drumShare
-                masks[0][k] = drumShare
-                masks[1][k] = tonal * bassWeight[k]
-                masks[2][k] = tonal * (1 - bassWeight[k]) * melodyWeight[k]
+                let rest = tonal * (1 - bassWeight[k])
+                var center: Float = 0
+                if useVocals {
+                    center = Self.centerWeight(
+                        leftRe: spectraRe[0][k], leftIm: spectraIm[0][k],
+                        rightRe: spectraRe[1][k], rightIm: spectraIm[1][k],
+                        exponent: exponent
+                    )
+                }
+                drumMask[k] = drumShare
+                bassMask[k] = tonal * bassWeight[k]
+                vocalMask[k] = rest * center
+                melodyMask[k] = useMelody ? rest * (1 - center) * melodyWeight[k] : 0
             }
-            let start = t * hop - fftSize / 2
-            for (channelIndex, channel) in channels.enumerated() {
-                Self.fillFrame(&frameBuffer, from: channel, frameCount: frameCount, start: start, window: window)
-                fft.forward(frameBuffer, real: &re, imag: &im)
-                for stem in 0..<extracted.count {
-                    let mask = masks[stem]
+            for (stem, kind) in extracted.enumerated() {
+                let mask: [Float]
+                switch kind {
+                case .drums: mask = drumMask
+                case .bass: mask = bassMask
+                case .vocals: mask = vocalMask
+                default: mask = melodyMask
+                }
+                for channelIndex in channels.indices {
+                    let sourceRe = spectraRe[channelIndex]
+                    let sourceIm = spectraIm[channelIndex]
                     for k in 0..<bins {
-                        maskedRe[k] = re[k] * mask[k]
-                        maskedIm[k] = im[k] * mask[k]
+                        maskedRe[k] = sourceRe[k] * mask[k]
+                        maskedIm[k] = sourceIm[k] * mask[k]
                     }
                     fft.inverse(real: maskedRe, imag: maskedIm, output: &timeSignal)
                     let lower = max(0, -start)
@@ -181,32 +256,53 @@ public struct SpectralStemSeparator: Sendable {
         let normalization = Self.windowSquareSum(window: window, hop: hop, frames: frames, frameCount: frameCount)
         for stem in 0..<extracted.count {
             for channelIndex in channels.indices {
-                for i in 0..<frameCount {
-                    let n = normalization[i]
-                    outputs[stem][channelIndex][i] = n > 1e-6 ? outputs[stem][channelIndex][i] / n : 0
+                outputs[stem][channelIndex].withUnsafeMutableBufferPointer { output in
+                    for i in 0..<frameCount {
+                        let n = normalization[i]
+                        output[i] = n > 1e-6 ? output[i] / n : 0
+                    }
                 }
             }
         }
         var stems = [StemKind: [[Float]]]()
+        let silent = channels.map { _ in [Float](repeating: 0, count: frameCount) }
+        for kind in StemKind.allCases where kind != .chords {
+            stems[kind] = silent
+        }
         for (index, kind) in extracted.enumerated() {
             stems[kind] = outputs[index]
         }
         // コード(伴奏)は残り。全パートの和が元の音と一致する。
         stems[.chords] = channels.enumerated().map { channelIndex, channel in
-            var rest = [Float](repeating: 0, count: frameCount)
-            for i in 0..<frameCount {
-                rest[i] = channel[i] - outputs[0][channelIndex][i] - outputs[1][channelIndex][i] - outputs[2][channelIndex][i]
+            var rest = Array(channel.prefix(frameCount))
+            for stem in 0..<extracted.count {
+                let part = outputs[stem][channelIndex]
+                for i in 0..<frameCount { rest[i] -= part[i] }
             }
             return rest
         }
         progress(1)
+        var steps = ["HPSS", "帯域"]
+        if useVocals { steps.append("中央定位") }
+        if useMelody { steps.append("音高追跡") }
         return StemSet(
             method: .spectral,
-            detail: "HPSS + 帯域 + 音高追跡(FFT \(fftSize))",
+            detail: steps.joined(separator: " + ") + "(FFT \(fftSize))",
             sampleRate: sampleRate,
             frameCount: frameCount,
-            stems: stems
+            stems: stems,
+            unavailable: unavailable
         )
+    }
+
+    /// 左右のスペクトルがどれだけ同じ(中央に定位している)か。0...1。
+    static func centerWeight(leftRe: Float, leftIm: Float, rightRe: Float, rightIm: Float, exponent: Float) -> Float {
+        let power = leftRe * leftRe + leftIm * leftIm + rightRe * rightRe + rightIm * rightIm
+        guard power > 1e-20 else { return 0 }
+        // 2·Re(L·conj(R)) / (|L|² + |R|²)。左右が同じなら 1、片側だけや逆相なら 0 以下。
+        let correlation = 2 * (leftRe * rightRe + leftIm * rightIm) / power
+        let clamped = max(0, min(1, correlation))
+        return pow(clamped, exponent)
     }
 
     // MARK: - Melody
