@@ -30,7 +30,8 @@ public enum MLSeparationError: LocalizedError {
 ///
 /// 曲全体の平均と標準偏差で正規化してから L ごとに区切って(25% 重ねて)推論し、重なりはなだらかにつなぐ。
 /// `vocals` を ボーカル、`drums` を ドラム、`bass` を ベース、それ以外(other / guitar / piano など)を コード(伴奏) にまとめる。
-/// モデルはメロディを出力しないので、コード(伴奏) から音高追跡で メロディ を近似的に取り出す(`SpectralStemSeparator`)。
+/// モデルはメロディを出力しないので、伴奏系の音源ごとに旋律を推定し、フレームごとに旋律が最もはっきりした音源から
+/// 音高追跡で メロディ を近似的に取り出す(`SpectralStemSeparator.splitMelody`)。htdemucs_6s ならギター・ピアノも別に扱える。
 public final class MLStemSeparator {
     public let model: MLModel
     public let modelName: String
@@ -247,6 +248,8 @@ public final class MLStemSeparator {
 
         // 正規化を戻し、元のサンプルレート・チャンネル数に合わせる。
         var stems = [StemKind: [[Float]]]()
+        var accompanimentSources = [[[Float]]]()
+        var accompanimentNames = [String]()
         for (source, name) in sourceNames.enumerated() {
             var stem = outputs[source]
             for channel in 0..<2 {
@@ -267,6 +270,12 @@ public final class MLStemSeparator {
                 stem = [zip(stem[0], stem[1]).map { ($0 + $1) / 2 }]
             }
             let kind = Self.stemKind(forSource: name)
+            if kind == .chords {
+                // 伴奏系の音源(other / guitar / piano)は、メロディを取り出すために別々に持っておく。
+                accompanimentSources.append(stem)
+                accompanimentNames.append(name)
+                continue
+            }
             if let existing = stems[kind] {
                 stems[kind] = zip(existing, stem).map { pair in zip(pair.0, pair.1).map { $0 + $1 } }
             } else {
@@ -274,26 +283,28 @@ public final class MLStemSeparator {
             }
         }
         let silent = [[Float]](repeating: [Float](repeating: 0, count: frameCount), count: channels.count)
-        for kind in StemKind.allCases where stems[kind] == nil {
-            stems[kind] = silent
-        }
 
-        // メロディは、伴奏(other など)から音高追跡で取り出す。全パートの和は変わらない。
-        if let accompaniment = stems[.chords] {
-            let melodySplit = try SpectralStemSeparator().separate(
-                channels: accompaniment,
-                sampleRate: sampleRate,
-                parts: [.melody]
-            ) { value in
+        // メロディは、伴奏系の音源ごとに旋律を推定し、フレームごとに最もはっきりした音源から取り出す。
+        var leadSummary = ""
+        if !accompanimentSources.isEmpty {
+            let split = try SpectralStemSeparator().splitMelody(from: accompanimentSources, sampleRate: sampleRate) { value in
                 progress(0.85 + 0.15 * value)
             }
-            stems[.melody] = melodySplit.channels(for: .melody)
-            stems[.chords] = melodySplit.channels(for: .chords)
+            stems[.melody] = split.melody
+            stems[.chords] = split.rest
+            if accompanimentSources.count > 1 {
+                leadSummary = "・旋律の出どころ: " + zip(accompanimentNames, split.leadShare)
+                    .map { "\($0) \(Int(($1 * 100).rounded()))%" }
+                    .joined(separator: ", ")
+            }
+        }
+        for kind in StemKind.allCases where stems[kind] == nil {
+            stems[kind] = silent
         }
         progress(1)
         return StemSet(
             method: .mlModel,
-            detail: "\(modelName)(\(sourceNames.joined(separator: ", ")))+ メロディは伴奏から音高追跡",
+            detail: "\(modelName)(\(sourceNames.joined(separator: ", ")))+ メロディは伴奏系の音源から音高追跡\(leadSummary)",
             sampleRate: sampleRate,
             frameCount: frameCount,
             stems: stems

@@ -16,7 +16,10 @@ macOS では、変換した Core ML モデルの出力も元のモデルと比�
 使い方(macOS):
     python3.11 -m venv .venv && source .venv/bin/activate
     pip install "demucs==4.0.1" "coremltools==8.1" numpy
-    python tools/convert_demucs_to_coreml.py --model htdemucs --output ~/Desktop/StemSeparator.mlpackage
+    python tools/convert_demucs_to_coreml.py --model htdemucs_6s --output ~/Desktop/StemSeparator6.mlpackage
+
+htdemucs_6s はギター・ピアノも別に出力するので、アプリでメロディとコードを分けやすくなる(おすすめ)。
+htdemucs(4 パート)も変換できる。
 
 モデルの重みは Meta が MIT ライセンスで公開しているもので、初回実行時に demucs が自動でダウンロードする。
 """

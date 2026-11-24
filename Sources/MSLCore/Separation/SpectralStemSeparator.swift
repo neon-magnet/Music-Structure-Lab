@@ -43,8 +43,25 @@ public struct SpectralStemSeparator: Sendable {
         public var voicingLevelRatio: Float = 0.05
         /// これより短い有声区間は無声として扱う(秒)。
         public var minimumVoicedDuration = 0.12
+        /// 高い音の候補を少し優先する度合い(主旋律は上の声部にあることが多いため)。
+        public var highPitchBias: Float = 0.4
 
         public init() {}
+    }
+
+    /// 主旋律の音高の推定結果(フレームごと)。
+    public struct MelodyTrack: Sendable {
+        /// 基本周波数(無声なら nil)。
+        public var f0: [Double?]
+        /// 旋律のはっきりさ(倍音の重み付き和の最大値)。別の音源どうしで比べるのに使う。
+        public var strength: [Float]
+        public var hopSize: Int
+
+        public init(f0: [Double?], strength: [Float], hopSize: Int) {
+            self.f0 = f0
+            self.strength = strength
+            self.hopSize = hopSize
+        }
     }
 
     /// 取り出せるパート(コード(伴奏) は常に残りになる)。
@@ -86,6 +103,7 @@ public struct SpectralStemSeparator: Sendable {
         channels: [[Float]],
         sampleRate: Double,
         parts: Set<StemKind> = Set(SpectralStemSeparator.extractableParts),
+        melodyOverride: [Double?]? = nil,
         progress: (Double) -> Void = { _ in }
     ) throws -> StemSet {
         let frameCount = channels.map(\.count).min() ?? 0
@@ -123,28 +141,10 @@ public struct SpectralStemSeparator: Sendable {
         }
 
         // 1. モノラルの振幅スペクトログラム。
-        var mono = [Float](repeating: 0, count: frameCount)
-        let channelScale = 1 / Float(channels.count)
-        for channel in channels {
-            for i in 0..<frameCount { mono[i] += channel[i] * channelScale }
-        }
-        var magnitude = [Float](repeating: 0, count: frames * bins)
+        var magnitude = try Self.magnitudeSpectrogram(
+            channels: channels, frameCount: frameCount, fft: fft, hop: hop, frames: frames, window: window
+        ) { progress(0.2 * $0) }
         var frameBuffer = [Float](repeating: 0, count: fftSize)
-        var re = [Float](repeating: 0, count: bins)
-        var im = [Float](repeating: 0, count: bins)
-        for t in 0..<frames {
-            if t % 64 == 0 {
-                try Task.checkCancellation()
-                progress(0.2 * Double(t) / Double(frames))
-            }
-            Self.fillFrame(&frameBuffer, from: mono, frameCount: frameCount, start: t * hop - fftSize / 2, window: window)
-            fft.forward(frameBuffer, real: &re, imag: &im)
-            let base = t * bins
-            for k in 0..<bins {
-                magnitude[base + k] = (re[k] * re[k] + im[k] * im[k]).squareRoot()
-            }
-        }
-        mono = []
 
         // 2. 持続音成分(時間方向のメディアン)。
         let harmonic = try Self.medianOverTime(magnitude, frames: frames, bins: bins, length: parameters.harmonicMedianLength) {
@@ -157,9 +157,16 @@ public struct SpectralStemSeparator: Sendable {
         progress(0.45)
 
         // 3. 主旋律の音高。
-        let melody = try useMelody
-            ? trackMelody(harmonic: harmonic, frames: frames, bins: bins, binHz: binHz, frameRate: sampleRate / Double(hop))
-            : [Double?](repeating: nil, count: frames)
+        let melody: [Double?]
+        if !useMelody {
+            melody = [Double?](repeating: nil, count: frames)
+        } else if let melodyOverride, melodyOverride.count == frames {
+            melody = melodyOverride
+        } else {
+            melody = try trackMelody(
+                harmonic: harmonic, frames: frames, bins: bins, binHz: binHz, frameRate: sampleRate / Double(hop)
+            ).f0
+        }
         progress(0.55)
 
         // 4. マスクをかけて逆変換する。
@@ -305,10 +312,127 @@ public struct SpectralStemSeparator: Sendable {
         return pow(clamped, exponent)
     }
 
+    /// モノラルにした信号の振幅スペクトログラム(`frames × bins`、行ごと)。
+    static func magnitudeSpectrogram(
+        channels: [[Float]],
+        frameCount: Int,
+        fft: RealFFT,
+        hop: Int,
+        frames: Int,
+        window: [Float],
+        progress: (Double) -> Void
+    ) throws -> [Float] {
+        let fftSize = fft.size
+        let bins = fft.binCount
+        var mono = [Float](repeating: 0, count: frameCount)
+        let channelScale = 1 / Float(channels.count)
+        for channel in channels {
+            for i in 0..<frameCount { mono[i] += channel[i] * channelScale }
+        }
+        var magnitude = [Float](repeating: 0, count: frames * bins)
+        var frameBuffer = [Float](repeating: 0, count: fftSize)
+        var re = [Float](repeating: 0, count: bins)
+        var im = [Float](repeating: 0, count: bins)
+        for t in 0..<frames {
+            if t % 64 == 0 {
+                try Task.checkCancellation()
+                progress(Double(t) / Double(frames))
+            }
+            fillFrame(&frameBuffer, from: mono, frameCount: frameCount, start: t * hop - fftSize / 2, window: window)
+            fft.forward(frameBuffer, real: &re, imag: &im)
+            let base = t * bins
+            for k in 0..<bins {
+                magnitude[base + k] = (re[k] * re[k] + im[k] * im[k]).squareRoot()
+            }
+        }
+        return magnitude
+    }
+
+    /// 音源の主旋律の音高を推定する(分離はしない)。
+    public func melodyTrack(channels: [[Float]], sampleRate: Double) throws -> MelodyTrack {
+        let frameCount = channels.map(\.count).min() ?? 0
+        let fftSize = Self.fftSize(for: sampleRate)
+        let hop = fftSize / 4
+        guard !channels.isEmpty, frameCount > 0, sampleRate > 0, let fft = RealFFT(size: fftSize) else {
+            return MelodyTrack(f0: [], strength: [], hopSize: hop)
+        }
+        let frames = frameCount / hop + 1
+        let magnitude = try Self.magnitudeSpectrogram(
+            channels: channels, frameCount: frameCount, fft: fft, hop: hop, frames: frames, window: Window.hann(fftSize)
+        ) { _ in }
+        let harmonic = try Self.medianOverTime(
+            magnitude, frames: frames, bins: fft.binCount, length: parameters.harmonicMedianLength
+        ) { _ in }
+        var track = try trackMelody(
+            harmonic: harmonic, frames: frames, bins: fft.binCount,
+            binHz: sampleRate / Double(fftSize), frameRate: sampleRate / Double(hop)
+        )
+        track.hopSize = hop
+        return track
+    }
+
+    /// 複数の楽器の音源(機械学習モデルの other / guitar / piano など)から、メロディを取り出す。
+    ///
+    /// 各音源の主旋律を推定し、フレームごとに旋律が最もはっきりしている音源だけからメロディを取り出す。
+    /// 同時に鳴っている別の楽器(伴奏)の音がメロディに混ざりにくくなる。取り出さなかった分は伴奏になる。
+    /// 戻り値の和は、入力の音源の和と一致する。
+    public func splitMelody(
+        from sources: [[[Float]]],
+        sampleRate: Double,
+        progress: (Double) -> Void = { _ in }
+    ) throws -> (melody: [[Float]], rest: [[Float]], leadShare: [Double]) {
+        guard let first = sources.first else { return ([], [], []) }
+        let channelCount = first.count
+        let frameCount = sources.flatMap { $0 }.map(\.count).min() ?? 0
+        var tracks = [MelodyTrack]()
+        for (index, source) in sources.enumerated() {
+            tracks.append(try melodyTrack(channels: source, sampleRate: sampleRate))
+            progress(0.4 * Double(index + 1) / Double(sources.count))
+        }
+        let frames = tracks.map(\.f0.count).min() ?? 0
+        // フレームごとに、旋律がいちばんはっきりした音源を選ぶ。
+        var chosen = [[Double?]](repeating: [Double?](repeating: nil, count: frames), count: sources.count)
+        var counts = [Int](repeating: 0, count: sources.count)
+        for t in 0..<frames {
+            var best: Int?
+            for index in sources.indices where tracks[index].f0[t] != nil {
+                if best == nil || tracks[index].strength[t] > tracks[best!].strength[t] {
+                    best = index
+                }
+            }
+            if let best {
+                chosen[best][t] = tracks[best].f0[t]
+                counts[best] += 1
+            }
+        }
+        var melody = [[Float]](repeating: [Float](repeating: 0, count: frameCount), count: channelCount)
+        var rest = melody
+        for (index, source) in sources.enumerated() {
+            let result = try separate(
+                channels: source,
+                sampleRate: sampleRate,
+                parts: [.melody],
+                melodyOverride: chosen[index]
+            ) { value in
+                progress(0.4 + 0.6 * (Double(index) + value) / Double(sources.count))
+            }
+            for channel in 0..<channelCount {
+                let m = result.channels(for: .melody)[channel]
+                let r = result.channels(for: .chords)[channel]
+                for i in 0..<frameCount {
+                    melody[channel][i] += m[i]
+                    rest[channel][i] += r[i]
+                }
+            }
+        }
+        let voiced = max(1, counts.reduce(0, +))
+        return (melody, rest, counts.map { Double($0) / Double(voiced) })
+    }
+
     // MARK: - Melody
 
     /// フレームごとの主旋律の基本周波数(無声なら nil)。
-    func trackMelody(harmonic: [Float], frames: Int, bins: Int, binHz: Double, frameRate: Double) throws -> [Double?] {
+    func trackMelody(harmonic: [Float], frames: Int, bins: Int, binHz: Double, frameRate: Double) throws -> MelodyTrack {
         let p = parameters
         let steps = max(1, p.stepsPerSemitone)
         let lowMidi = 69 + 12 * log2(p.melodyLowestHz / 440)
@@ -402,20 +526,22 @@ public struct SpectralStemSeparator: Sendable {
             }
             t = end
         }
-        return result
+        return MelodyTrack(f0: result, strength: frameMaxima, hopSize: 0)
     }
 
     private func viterbi(salience: [Float], candidates: Int, from start: Int, to end: Int) -> [Int] {
         let length = end - start
         guard length > 0 else { return [] }
         let penalty = parameters.jumpPenalty
+        let highBias = parameters.highPitchBias
         var back = [Int32](repeating: 0, count: length * candidates)
         func emission(_ t: Int) -> [Float] {
             let base = t * candidates
             var maxValue: Float = 0
             for c in 0..<candidates { maxValue = max(maxValue, salience[base + c]) }
             let scale = maxValue > 0 ? 1 / maxValue : 0
-            return (0..<candidates).map { log(salience[base + $0] * scale + 1e-3) }
+            let bias = candidates > 1 ? highBias / Float(candidates - 1) : 0
+            return (0..<candidates).map { log(salience[base + $0] * scale + 1e-3) + bias * Float($0) }
         }
         var score = emission(start)
         var next = [Float](repeating: 0, count: candidates)

@@ -253,7 +253,7 @@ final class SpectralStemSeparatorTests: XCTestCase {
         let melody = try separator.trackMelody(
             harmonic: magnitude, frames: frames, bins: bins,
             binHz: sampleRate / Double(fftSize), frameRate: sampleRate / Double(hop)
-        )
+        ).f0
         let expected = [523.25, 587.33, 659.25, 783.99]
         var correct = 0
         var judged = 0
@@ -267,6 +267,37 @@ final class SpectralStemSeparatorTests: XCTestCase {
             }
         }
         XCTAssertGreaterThan(Double(correct) / Double(max(1, judged)), 0.9, "\(correct)/\(judged)")
+    }
+
+    func testSplitMelodyTakesLeadFromOneSource() throws {
+        // 機械学習モデルの other / piano のように、伴奏と旋律が別の音源に分かれている場合。
+        let sources = makeSources()
+        let chords = sources[.chords]!
+        let melody = sources[.melody]!
+        let count = melody.count
+        let (extracted, rest, share) = try SpectralStemSeparator().splitMelody(
+            from: [[chords], [melody]],
+            sampleRate: sampleRate
+        )
+        XCTAssertEqual(share.count, 2)
+        XCTAssertGreaterThan(share[1], 0.8, "旋律は 2 つ目の音源から取る: \(share)")
+        let correlationToMelody = correlation(extracted[0], melody)
+        XCTAssertGreaterThan(correlationToMelody, 0.8, "melody \(correlationToMelody)")
+        // 伴奏の音源の音は、ほとんどメロディに入らない。
+        let chordLeak = correlation(extracted[0], chords)
+        XCTAssertLessThan(chordLeak, 0.3, "chord leak \(chordLeak)")
+        for i in stride(from: 0, to: count, by: 89) {
+            XCTAssertEqual(extracted[0][i] + rest[0][i], chords[i] + melody[i], accuracy: 1e-3)
+        }
+    }
+
+    func testMelodyTrackReportsStrength() throws {
+        let sources = makeSources(duration: 2)
+        let track = try SpectralStemSeparator().melodyTrack(channels: [sources[.melody]!], sampleRate: sampleRate)
+        XCTAssertEqual(track.f0.count, track.strength.count)
+        XCTAssertGreaterThan(track.f0.compactMap { $0 }.count, track.f0.count / 2)
+        let silent = try SpectralStemSeparator().melodyTrack(channels: [[Float](repeating: 0, count: 20_000)], sampleRate: sampleRate)
+        XCTAssertTrue(silent.f0.allSatisfy { $0 == nil })
     }
 
     func testMedianAndShortRuns() {
