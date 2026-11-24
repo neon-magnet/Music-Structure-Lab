@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreML
 @testable import MSLAudio
 import MSLCore
 import XCTest
@@ -92,6 +93,13 @@ final class AudioPlayerBufferTests: XCTestCase {
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "vocals"), .vocals)
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "other"), .chords)
         XCTAssertEqual(MLStemSeparator.stemKind(forSource: "piano"), .chords)
+    }
+
+    func testComputeUnitsFromMetadata() {
+        XCTAssertEqual(MLStemSeparator.computeUnits(fromMetadata: nil), .cpuAndGPU)
+        XCTAssertEqual(MLStemSeparator.computeUnits(fromMetadata: "cpuOnly"), .cpuOnly)
+        XCTAssertEqual(MLStemSeparator.computeUnits(fromMetadata: "all"), .all)
+        XCTAssertEqual(MLStemSeparator.computeUnits(fromMetadata: "unknown"), .cpuAndGPU)
     }
 
     func testResampleChangesLength() throws {

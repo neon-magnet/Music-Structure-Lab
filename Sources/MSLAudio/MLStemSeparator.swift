@@ -40,14 +40,38 @@ public final class MLStemSeparator {
     let segmentLength: Int
     let sourceNames: [String]
     let modelSampleRate: Double
+    let computeUnits: MLComputeUnits
+
+    static func configuration(units: MLComputeUnits) -> MLModelConfiguration {
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = units
+        return configuration
+    }
+
+    /// メタデータの値(cpuOnly / cpuAndGPU / all)から計算装置を選ぶ。無い・不明なら CPU + GPU。
+    static func computeUnits(fromMetadata value: String?) -> MLComputeUnits {
+        switch value {
+        case "cpuOnly": return .cpuOnly
+        case "all": return .all
+        default: return .cpuAndGPU
+        }
+    }
 
     /// コンパイル済みのモデル (.mlmodelc) を読み込む。
     public init(compiledModelURL: URL, name: String? = nil) throws {
-        let configuration = MLModelConfiguration()
-        configuration.computeUnits = .all
+        // Neural Engine は内部で 16bit 浮動小数点を使い、Demucs では値があふれて結果が壊れることがある。
+        // 既定は CPU + GPU とし、変換時に確かめた計算装置がメタデータ `compute_units` にあればそれを使う。
         let model: MLModel
         do {
-            model = try MLModel(contentsOf: compiledModelURL, configuration: configuration)
+            let probe = try MLModel(contentsOf: compiledModelURL, configuration: Self.configuration(units: .cpuAndGPU))
+            let requested = (probe.modelDescription.metadata[.creatorDefinedKey] as? [String: String])?["compute_units"]
+            let units = Self.computeUnits(fromMetadata: requested)
+            if units == .cpuAndGPU {
+                model = probe
+            } else {
+                model = try MLModel(contentsOf: compiledModelURL, configuration: Self.configuration(units: units))
+            }
+            computeUnits = units
         } catch {
             throw MLSeparationError.unsupportedModel(reason: error.localizedDescription)
         }
@@ -103,7 +127,13 @@ public final class MLStemSeparator {
     /// 画面に出すモデルの説明。
     public var summary: String {
         let seconds = Double(segmentLength) / modelSampleRate
-        return "\(Int(modelSampleRate)) Hz・\(String(format: "%.1f", seconds)) 秒ごと・パート: \(sourceNames.joined(separator: ", "))"
+        let units: String
+        switch computeUnits {
+        case .cpuOnly: units = "CPU"
+        case .all: units = "CPU+GPU+Neural Engine"
+        default: units = "CPU+GPU"
+        }
+        return "\(Int(modelSampleRate)) Hz・\(String(format: "%.1f", seconds)) 秒ごと・\(units)・パート: \(sourceNames.joined(separator: ", "))"
     }
 
     /// パート名を、アプリのパートに対応づける。

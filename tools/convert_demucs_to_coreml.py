@@ -217,14 +217,40 @@ def main() -> int:
     print(f"saved: {args.output}")
 
     if sys.platform == "darwin":
-        # 変換したモデルを実際に動かして、元のモデルと比べる。
-        try:
-            prediction = mlmodel.predict({"mix": example.numpy().astype(np.float32)})["sources"]
-            core_ml_difference = float(np.abs(prediction - reference.numpy()).max())
-            print(f"Core ML と PyTorch の出力の差(最大): {core_ml_difference:.2e}(出力の最大値 {reference.abs().max().item():.2e})")
-        except Exception as error:  # noqa: BLE001
-            print(f"変換したモデルの試し実行に失敗しました: {type(error).__name__}: {error}", file=sys.stderr)
+        # 変換したモデルを計算装置ごとに動かして、元のモデルと比べる。
+        # Neural Engine は内部で 16bit 浮動小数点を使うので、値の大きい層があると結果が壊れることがある。
+        scale = reference.abs().max().item()
+        expected = reference.numpy()
+        mix = {"mix": example.numpy().astype(np.float32)}
+        results = {}
+        for label, units in [("CPU", ct.ComputeUnit.CPU_ONLY),
+                             ("CPU+GPU", ct.ComputeUnit.CPU_AND_GPU),
+                             ("すべて (Neural Engine を含む)", ct.ComputeUnit.ALL)]:
+            try:
+                loaded = ct.models.MLModel(args.output, compute_units=units)
+                prediction = loaded.predict(mix)["sources"]
+                diff = float(np.nanmax(np.abs(prediction - expected))) if np.all(np.isfinite(prediction)) else float("inf")
+            except Exception as error:  # noqa: BLE001
+                print(f"[{label}] 実行できませんでした: {type(error).__name__}: {error}")
+                continue
+            ok = diff < max(1e-3, scale * 1e-2)
+            results[label] = ok
+            print(f"[{label}] Core ML と PyTorch の出力の差(最大): {diff:.2e}(出力の最大値 {scale:.2e})→ {'OK' if ok else 'ずれが大きい'}")
+
+        if results.get("CPU+GPU"):
+            recommended = "cpuAndGPU"
+        elif results.get("CPU"):
+            recommended = "cpuOnly"
+        else:
+            print("CPU でも出力が一致しませんでした。変換そのものに問題があります。上の出力をすべて共有してください。",
+                  file=sys.stderr)
             return 4
+        if results.get("すべて (Neural Engine を含む)"):
+            recommended = "all"
+        # アプリはこの値を読んで、計算装置を選ぶ。
+        mlmodel.user_defined_metadata["compute_units"] = recommended
+        mlmodel.save(args.output)
+        print(f"アプリで使う計算装置: {recommended}(モデルに記録しました)")
 
     print("アプリのインスペクタ「パート」→「機械学習モデル」→「モデルを読み込む…」で選んでください。")
     return 0
