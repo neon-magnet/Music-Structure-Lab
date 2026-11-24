@@ -29,9 +29,30 @@ Music Structure Lab のパート分離には 2 つの方法があります。
 
 ## Demucs から作る
 
-`tools/convert_demucs_to_coreml.py` で、Meta が MIT ライセンスで公開している Demucs (HTDemucs) を変換できます(使い方はスクリプト冒頭)。
+`tools/convert_demucs_to_coreml.py` で、Meta が MIT ライセンスで公開している Demucs (HTDemucs) を変換できます。
 
-**このスクリプトは開発環境で実行・検証できていません**(モデルの重みをダウンロードできないため)。
-HTDemucs は内部で STFT を使うので、coremltools のバージョンによっては変換に失敗します。
-変換できたモデルは、インスペクタの「パート」→「機械学習モデル」→「モデルを読み込む…」で選びます。
+```
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install "demucs==4.0.1" "coremltools==8.1" numpy
+python tools/convert_demucs_to_coreml.py --model htdemucs --output ~/Desktop/StemSeparator.mlpackage
+```
+
+HTDemucs は内部で複素数の STFT を使っていて、そのままでは Core ML に変換できません。スクリプトでは変換の前に次の置き換えをします(計算結果は同じです)。
+
+- STFT / 逆 STFT を、DFT の基底を重みにした畳み込みに置き換える
+- 複素数のテンソルを、実部・虚部を並べた実数のテンソルに置き換える
+- 入力の長さを固定する
+- coremltools 8.1 が NumPy 2 で `int` 演算の変換に失敗する問題を回避する
+- Transformer の推論用の高速経路を使わずにトレースする
+
+スクリプトは、置き換え前後の PyTorch の出力が一致するかを確かめてから変換します。macOS では、変換した Core ML モデルの出力も元のモデルと比べて表示します。
+
+確認済みの範囲:
+
+- Linux 上で、同じ構造の HTDemucs(学習済みの重みではなくランダムな重み)を使い、置き換え前後の出力の差が 1e-7 程度であることを確かめた
+- 変換が最後まで通り、入力 `[1, 2, 343980]`・出力 `[1, 4, 2, 343980]` の .mlpackage(約 275MB)ができることを確かめた
+- Core ML での推論は macOS でしか動かせないため、まだ確かめていない(スクリプトが macOS で自動的に比べる)
+
+変換したモデルは、インスペクタの「パート」→「機械学習モデル」→「モデルを読み込む…」で選びます。
 読み込んだモデルはコンパイルしてアプリのコンテナ(Application Support/Music Structure Lab/StemModels)に保存します。
